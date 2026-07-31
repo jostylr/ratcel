@@ -14,3 +14,7 @@ The first standalone milestone includes formula editing, assignment modes,
 exact-value feedback, named tensor coordinates, local recovery, native
 `.rixcel` open/save, CSV/TSV import/export, and document undo/redo. The shared
 runtime and widget protocol live in the sibling `rix` repository.
+
+Formula parse, cycle, and runtime failures are recoverable in place. The grid
+marks affected cells, keeps their last committed values visible, and preserves
+the failed source in the formula editor until it is corrected.
