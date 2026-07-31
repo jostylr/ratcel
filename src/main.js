@@ -74,9 +74,11 @@ function bindModel(next, nextName, { resetHistory = true } = {}) {
         historyIndex = -1;
     }
     unsubscribe = model.subscribe((event) => {
-        if (event.type === "formula:commit") {
+        if (event.type === "formula:commit" || event.type === "formula:view") {
             remember();
-            setStatus(`Saved locally · epoch ${model.epoch}`);
+            setStatus(event.type === "formula:view"
+                ? "Saved labels locally"
+                : `Saved locally · epoch ${model.epoch}`);
         } else if (event.type === "formula:error") {
             setStatus(event.error?.message || "Formula error");
         }

@@ -14277,14 +14277,14 @@ function coordinateForValue(value, axis, shape, axes, axisLabels, label) {
   const labels = axisLabels[axis];
   if (!labels)
     throw new Error(`${label} axis ${axes[axis]} has no coordinate labels`);
-  const exact = labels.map((name, index) => name === requested ? index + 1 : -1).filter((index) => index >= 1);
+  const exact = labels.map((name, index) => name !== null && name === requested ? index + 1 : -1).filter((index) => index >= 1);
   if (exact.length === 1)
     return exact[0];
   if (exact.length > 1) {
     throw new Error(`${label} coordinate label is ambiguous on ${axes[axis]}: ${requested}`);
   }
   const folded = requested.toLocaleLowerCase();
-  const insensitive = labels.map((name, index) => name.toLocaleLowerCase() === folded ? index + 1 : -1).filter((index) => index >= 1);
+  const insensitive = labels.map((name, index) => typeof name === "string" && name.toLocaleLowerCase() === folded ? index + 1 : -1).filter((index) => index >= 1);
   if (insensitive.length === 1)
     return insensitive[0];
   if (insensitive.length > 1) {
@@ -14478,6 +14478,8 @@ function formulaSheetMethods() {
     ["INDEX", method2("Index", ([target, selector2]) => target.index(selector2))],
     ["AT", method2("At", ([target, selector2]) => target.at(selector2))],
     ["SLOTAT", method2("SlotAt", ([target, selector2]) => target.slotAt(selector2))],
+    ["NEAR", method2("Near", ([target, origin, offsets]) => target.near(origin, offsets))],
+    ["SETAXISLABEL", method2("SetAxisLabel", ([target, axis, coordinate, label]) => target.setAxisLabel(axis, coordinate, label))],
     ["RECALCULATE", method2("Recalculate", ([target]) => target.recalculate())],
     ["SLOT", method2("Slot", ([target, ...index]) => target.slot(index))],
     ["GRAPH", method2("Graph", ([target]) => target.graph)],
@@ -14527,6 +14529,7 @@ function createFormulaSheet(formulasValue, options = {}) {
     }];
   }));
   const channel = new Set;
+  let currentDocumentView = Object.freeze({ ...options.documentView ?? {} });
   const graph = createReactiveGraph({
     id: `${id}:graph`,
     preserveIdentifierCase: true,
@@ -14548,7 +14551,9 @@ function createFormulaSheet(formulasValue, options = {}) {
     id,
     shape,
     rank: shape.length,
-    documentView: Object.freeze({ ...options.documentView ?? {} }),
+    get documentView() {
+      return currentDocumentView;
+    },
     graph,
     get epoch() {
       return graph.epoch;
@@ -14563,6 +14568,22 @@ function createFormulaSheet(formulasValue, options = {}) {
     },
     at(selector2) {
       return sheet.get(resolveLabeledCoordinate(shape, sheet.documentView, selector2, "FormulaSheet.At"));
+    },
+    near(origin, offsetsValue) {
+      const normalizedOrigin = normalizeIndex2(origin, shape);
+      const offsets = valuesOf(offsetsValue, "FormulaSheet.Near offsets");
+      if (offsets.length !== shape.length) {
+        throw new Error(`near expects ${shape.length} offsets, got ${offsets.length}`);
+      }
+      const target = offsets.map((offset, axis) => {
+        const delta = exactIndex(offset, `near axis ${axis + 1} offset`);
+        const coordinate = normalizedOrigin[axis] + delta;
+        if (coordinate < 1 || coordinate > shape[axis]) {
+          throw new Error(`near[${offsets.join(",")}] from ${addressFor(normalizedOrigin)} is out of range on axis ${axis + 1}`);
+        }
+        return coordinate;
+      });
+      return sheet.get(target);
     },
     slotAt(selector2) {
       return sheet.slot(resolveLabeledCoordinate(shape, sheet.documentView, selector2, "FormulaSheet.SlotAt"));
@@ -14593,8 +14614,11 @@ function createFormulaSheet(formulasValue, options = {}) {
       const previousMode = record.assignmentMode;
       const nextSource = metadata?.source ?? options.formulaSource?.(formula) ?? null;
       const nextMode = assignmentMode(metadata?.assignmentMode ?? record.assignmentMode);
+      const previousView = record.view;
+      const nextView = record.view?.blank === true ? Object.freeze(Object.fromEntries(Object.entries(record.view).filter(([key]) => key !== "blank"))) : record.view;
       record.source = nextSource;
       record.assignmentMode = nextMode;
+      record.view = nextView;
       try {
         graph.setFormula(nodeNameFor(normalized), formula, {
           ...metadata,
@@ -14611,6 +14635,7 @@ function createFormulaSheet(formulasValue, options = {}) {
         if (graph.node(nodeNameFor(normalized)).formula !== formula) {
           record.source = previousSource;
           record.assignmentMode = previousMode;
+          record.view = previousView;
         }
         throw error;
       }
@@ -14628,6 +14653,40 @@ function createFormulaSheet(formulasValue, options = {}) {
         assignmentMode: parts.assignmentMode,
         sourceKind: "formula-source"
       });
+    },
+    setAxisLabel(axisValue, coordinateValue, labelValue) {
+      const axis = exactIndex(axisValue, "FormulaSheet axis label axis");
+      if (axis < 1 || axis > shape.length) {
+        throw new Error(`FormulaSheet axis ${axis} is out of range`);
+      }
+      const coordinate = exactIndex(coordinateValue, `FormulaSheet axis ${axis} label coordinate`);
+      if (coordinate < 1 || coordinate > shape[axis - 1]) {
+        throw new Error(`FormulaSheet axis ${axis} label coordinate ${coordinate} is out of range`);
+      }
+      const label = labelValue === null || labelValue === undefined ? null : text3(labelValue, "FormulaSheet axis label").trim() || null;
+      const schema = labelSchema(shape, currentDocumentView);
+      const axisLabels = schema.axisLabels.map((labels, index) => labels === null ? Array(shape[index]).fill(null) : [...labels]);
+      axisLabels[axis - 1] = axisLabels[axis - 1].map((entry, index) => index === coordinate - 1 ? label : entry);
+      const normalizedLabels = axisLabels.map((labels) => labels.every((entry) => entry === null) ? null : Object.freeze(labels));
+      const nextView = Object.fromEntries(Object.entries(currentDocumentView).filter(([key]) => key.toLocaleLowerCase() !== "axislabels"));
+      currentDocumentView = Object.freeze({
+        ...nextView,
+        axisLabels: Object.freeze(normalizedLabels)
+      });
+      const event = Object.freeze({
+        type: "formula:view",
+        sheet,
+        epoch: sheet.epoch,
+        cause: Object.freeze({
+          type: "view:axis-label",
+          axis,
+          coordinate,
+          label
+        })
+      });
+      for (const listener of [...channel])
+        listener(event);
+      return sheet;
     },
     slot(index) {
       const normalized = normalizeIndex2(index, shape);
@@ -14658,18 +14717,7 @@ function createFormulaSheet(formulasValue, options = {}) {
           rank: shape.length,
           index,
           get(offsets) {
-            if (offsets.length !== shape.length) {
-              throw new Error(`near expects ${shape.length} offsets, got ${offsets.length}`);
-            }
-            const target = offsets.map((offset, axis) => {
-              const delta = exactIndex(offset, `near axis ${axis + 1} offset`);
-              const coordinate = index[axis] + delta;
-              if (coordinate < 1 || coordinate > shape[axis]) {
-                throw new Error(`near[${offsets.join(",")}] from ${addressFor(index)} is out of range on axis ${axis + 1}`);
-              }
-              return coordinate;
-            });
-            return sheet.get(target);
+            return sheet.near(index, offsets);
           }
         });
         const contextualBindings = [
@@ -14894,7 +14942,11 @@ function sheetData(value) {
       formulaSourceAt: (index) => value.slot(index).source,
       formulaMetadataAt: (index) => {
         const slot = value.slot(index);
-        return { slotId: slot.id, assignmentMode: slot.assignmentMode };
+        return {
+          slotId: slot.id,
+          assignmentMode: slot.assignmentMode,
+          blank: slot.view?.blank === true
+        };
       }
     };
   }
@@ -15055,6 +15107,8 @@ function createSheet(args) {
       throw new Error(`Sheet axisLabels axis ${axisIndex + 1} must contain ${data.shape[axisIndex]} labels`);
     }
     return Object.freeze(values.map((label, labelIndex) => {
+      if (label === null)
+        return null;
       const name = asString(label);
       if (name === null || name.length === 0) {
         throw new Error(`Sheet axisLabels axis ${axisIndex + 1} label ${labelIndex + 1} must be a nonempty string`);
@@ -15081,15 +15135,22 @@ function createSheet(args) {
   const columnAxis = viewAxes[1] ?? null;
   const rowCount = data.shape[rowAxis - 1];
   const columnCount = columnAxis === null ? 1 : data.shape[columnAxis - 1];
-  const rowHeaders = axisLabels[rowAxis - 1] ? [...axisLabels[rowAxis - 1]] : Array.from({ length: rowCount }, (_item, index) => String(index + 1));
-  const columnHeaders = columnAxis !== null && axisLabels[columnAxis - 1] ? [...axisLabels[columnAxis - 1]] : Array.from({ length: columnCount }, (_item, index) => sheetColumnLabel(index + 1, columnLabelMode));
+  const rowHeaders = Array.from({ length: rowCount }, (_item, index) => {
+    const label = axisLabels[rowAxis - 1]?.[index] ?? null;
+    return label === null ? String(index + 1) : `${label} · ${index + 1}`;
+  });
+  const columnHeaders = Array.from({ length: columnCount }, (_item, index) => {
+    const label = columnAxis === null ? null : axisLabels[columnAxis - 1]?.[index] ?? null;
+    const fallback = sheetColumnLabel(index + 1, columnLabelMode);
+    return label === null ? fallback : `${label} · ${index + 1}`;
+  });
   const hiddenAxes = data.shape.map((length, index) => ({
     axis: index + 1,
     name: axes[index],
     length,
     selected: slice[index],
     ...axisLabels[index] ? {
-      labels: axisLabels[index],
+      labels: axisLabels[index].map((label, coordinate) => label === null ? String(coordinate + 1) : `${label} · ${coordinate + 1}`),
       selectedLabel: axisLabels[index][slice[index] - 1]
     } : {}
   })).filter(({ axis }) => !visibleAxes.has(axis));
@@ -15105,6 +15166,7 @@ function createSheet(args) {
       formulaSource: data.formulaSourceAt?.(index) ?? null,
       slotId: formulaMetadata?.slotId ?? null,
       assignmentMode: formulaMetadata?.assignmentMode ?? null,
+      blank: formulaMetadata?.blank === true,
       index: Object.freeze(index),
       coordinateLabels: Object.freeze(coordinateLabels),
       coordinateLabel: coordinateLabels.filter((label) => label !== null).join(" / ") || null,
@@ -15545,7 +15607,7 @@ function renderGraphicSvg(graphic, format = (item) => String(item ?? "")) {
   return `<svg class="rix-output-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size[0]} ${size[1]}" width="${size[0]}" height="${size[1]}" role="img">${defs.length ? `<defs>${defs.join("")}</defs>` : ""}${children}</svg>`;
 }
 function formatSheetText(sheet, format) {
-  const strings = sheet.cells.map((row) => row.map((cell) => cellText(cell.value, format)));
+  const strings = sheet.cells.map((row) => row.map((cell) => cell.blank ? "" : cell.value === null ? "_" : cellText(cell.value, format)));
   const rowHeaderWidth = Math.max(1, ...sheet.rowHeaders.map((header2) => header2.length));
   const columnWidths = sheet.columnHeaders.map((header2, column) => Math.max(header2.length, 1, ...strings.map((row) => row[column]?.length ?? 0)));
   const heading = [
@@ -15638,12 +15700,13 @@ function renderOutputHtml(value, format = (item) => String(item ?? "")) {
     const summary = `${value.addressBase} · shape ${value.shape.join("×")}`;
     const axisSummary = value.columnAxis ? `Rows: ${value.rowAxis.name} · Columns: ${value.columnAxis.name}` : `Rows: ${value.rowAxis.name}`;
     const controls = value.hiddenAxes.length === 0 ? "" : `<div class="rix-output-sheet-plane-controls" aria-label="Tensor plane">${value.hiddenAxes.map(({ axis, name, length, selected, labels }) => `<label><span>${escapeHtml(name)} · axis ${axis}</span><select data-rix-sheet-axis="${axis}" aria-label="${escapeHtml(name)} axis ${axis}">${Array.from({ length }, (_item, index) => `<option value="${index + 1}"${selected === index + 1 ? " selected" : ""}>${escapeHtml(labels?.[index] ?? String(index + 1))}</option>`).join("")}</select></label>`).join("")}</div>`;
-    const bodies = value.planes.map((plane) => `<tbody data-rix-plane-key="${escapeHtml(plane.key)}" data-rix-slice="${plane.slice.map((item) => item ?? "").join(",")}"${plane.key === value.selectedPlaneKey ? "" : " hidden"}>${plane.cells.map((row, rowIndex) => `<tr><th scope="row" data-rix-row="${rowIndex + 1}"${value.axisLabels[value.rowAxis.axis - 1] ? ` title="${escapeHtml(value.rowAxis.name)} ${rowIndex + 1}"` : ""}>${escapeHtml(value.rowHeaders[rowIndex])}</th>${row.map((cell, columnIndex) => `<td data-rix-row="${rowIndex + 1}" data-rix-column="${columnIndex + 1}" data-rix-index="${cell.index.join(",")}" data-rix-address="${escapeHtml(cell.address)}" data-rix-display-address="${escapeHtml(cell.displayAddress)}"${cell.coordinateLabel === null ? "" : ` data-rix-coordinate-labels="${escapeHtml(JSON.stringify(cell.coordinateLabels))}" data-rix-coordinate-label="${escapeHtml(cell.coordinateLabel)}"`}${cell.formulaSource === null ? "" : ` data-rix-formula-source="${escapeHtml(cell.formulaSource)}"`}${cell.slotId === null ? "" : ` data-rix-slot-id="${escapeHtml(cell.slotId)}"`}${cell.assignmentMode === null ? "" : ` data-rix-assignment-mode="${escapeHtml(cell.assignmentMode)}"`} title="${cell.coordinateLabel === null ? "" : `${escapeHtml(cell.coordinateLabel)} · `}${escapeHtml(cell.displayAddress)} · ${escapeHtml(cell.address)}">${text4(cell.value)}</td>`).join("")}</tr>`).join("")}</tbody>`).join("");
+    const headerAttributes = (axis, coordinate, fallback) => value.formulaBacked ? ` class="rix-sheet-header-editable" tabindex="0" data-rix-header-axis="${axis}" data-rix-header-coordinate="${coordinate}" data-rix-header-label="${escapeHtml(value.axisLabels[axis - 1]?.[coordinate - 1] ?? "")}" data-rix-header-fallback="${escapeHtml(fallback)}"` : "";
+    const bodies = value.planes.map((plane) => `<tbody data-rix-plane-key="${escapeHtml(plane.key)}" data-rix-slice="${plane.slice.map((item) => item ?? "").join(",")}"${plane.key === value.selectedPlaneKey ? "" : " hidden"}>${plane.cells.map((row, rowIndex) => `<tr><th scope="row" data-rix-row="${rowIndex + 1}"${headerAttributes(value.rowAxis.axis, rowIndex + 1, String(rowIndex + 1))}${value.axisLabels[value.rowAxis.axis - 1] ? ` title="${escapeHtml(value.rowAxis.name)} ${rowIndex + 1}"` : ""}>${escapeHtml(value.rowHeaders[rowIndex])}</th>${row.map((cell, columnIndex) => `<td data-rix-row="${rowIndex + 1}" data-rix-column="${columnIndex + 1}" data-rix-index="${cell.index.join(",")}" data-rix-address="${escapeHtml(cell.address)}" data-rix-display-address="${escapeHtml(cell.displayAddress)}"${cell.blank ? ' data-rix-blank="true"' : ""}${cell.coordinateLabel === null ? "" : ` data-rix-coordinate-labels="${escapeHtml(JSON.stringify(cell.coordinateLabels))}" data-rix-coordinate-label="${escapeHtml(cell.coordinateLabel)}"`}${cell.formulaSource === null ? "" : ` data-rix-formula-source="${escapeHtml(cell.formulaSource)}"`}${cell.slotId === null ? "" : ` data-rix-slot-id="${escapeHtml(cell.slotId)}"`}${cell.assignmentMode === null ? "" : ` data-rix-assignment-mode="${escapeHtml(cell.assignmentMode)}"`} title="${cell.coordinateLabel === null ? "" : `${escapeHtml(cell.coordinateLabel)} · `}${escapeHtml(cell.displayAddress)} · ${escapeHtml(cell.address)}">${cell.blank ? "" : cell.value === null ? "_" : text4(cell.value)}</td>`).join("")}</tr>`).join("")}</tbody>`).join("");
     const liveAttributes = value.editable ? ` data-rix-editable="true" data-rix-edit-mode="${value.editMode}"${value.bindingId ? ` data-rix-binding-id="${escapeHtml(value.bindingId)}"` : ""}` : "";
     const assignmentControl = value.editMode === "formula" ? `<label class="rix-output-sheet-assignment"><span>Assignment</span><select data-rix-edit-assignment-mode aria-label="Formula assignment mode">${FORMULA_SHEET_ASSIGNMENT_MODES.map((mode) => `<option value="${escapeHtml(mode)}"${mode === ":=" ? " selected" : ""}>${escapeHtml(mode)}</option>`).join("")}</select></label>` : "";
     const editor = value.editable ? `<form class="rix-output-sheet-editor" hidden><label class="rix-output-sheet-formula"><span data-rix-edit-label>Choose a cell to edit</span><input data-rix-edit-source aria-label="${value.editMode === "formula" ? "RiX formula" : "RiX value"}" autocomplete="off" spellcheck="false"></label>${assignmentControl}<button type="submit">${value.editMode === "formula" ? "Set formula" : "Set"}</button><output data-rix-edit-value aria-live="polite"></output><output data-rix-edit-status aria-live="polite"></output></form>` : "";
     const formulaAttributes = value.formulaBacked ? ` data-rix-formula-sheet="true" data-rix-formula-epoch="${value.formulaSheet.epoch}"` : "";
-    return `<section class="rix-output-sheet" data-rix-rank="${value.rank}" data-rix-selected-plane="${escapeHtml(value.selectedPlaneKey)}"${liveAttributes}${formulaAttributes}>${value.title ? `<h3 class="rix-output-sheet-title">${escapeHtml(value.title)}</h3>` : ""}<div class="rix-output-sheet-location" aria-live="polite" data-rix-summary="${escapeHtml(summary)}">${escapeHtml(summary)}</div>${value.showAxisSummary ? `<div class="rix-output-sheet-axis-summary">${escapeHtml(axisSummary)}</div>` : ""}${controls}${editor}<table><thead><tr><th class="rix-output-sheet-corner" scope="col">${escapeHtml(value.addressBase)}</th>${value.columnHeaders.map((header, column) => `<th scope="col" data-rix-column="${column + 1}"${value.columnAxis && value.axisLabels[value.columnAxis.axis - 1] ? ` title="${escapeHtml(value.columnAxis.name)} ${column + 1}"` : ""}>${escapeHtml(header)}</th>`).join("")}</tr></thead>${bodies}</table></section>`;
+    return `<section class="rix-output-sheet" data-rix-rank="${value.rank}" data-rix-selected-plane="${escapeHtml(value.selectedPlaneKey)}"${liveAttributes}${formulaAttributes}>${value.title ? `<h3 class="rix-output-sheet-title">${escapeHtml(value.title)}</h3>` : ""}<div class="rix-output-sheet-location" aria-live="polite" data-rix-summary="${escapeHtml(summary)}">${escapeHtml(summary)}</div>${value.showAxisSummary ? `<div class="rix-output-sheet-axis-summary">${escapeHtml(axisSummary)}</div>` : ""}${controls}${editor}<table><thead><tr><th class="rix-output-sheet-corner" scope="col">${escapeHtml(value.addressBase)}</th>${value.columnHeaders.map((header, column) => `<th scope="col" data-rix-column="${column + 1}"${value.columnAxis ? headerAttributes(value.columnAxis.axis, column + 1, sheetColumnLabel(column + 1, value.columnLabelMode)) : ""}${value.columnAxis && value.axisLabels[value.columnAxis.axis - 1] ? ` title="${escapeHtml(value.columnAxis.name)} ${column + 1}"` : ""}>${escapeHtml(header)}</th>`).join("")}</tr></thead>${bodies}</table></section>`;
   }
   if (value.kind === "figure")
     return `<figure class="rix-output-figure"${value.label ? ` id="${escapeHtml(value.label)}"` : ""}>${renderOutputHtml(value.content, format)}${value.caption ? `<figcaption>${escapeHtml(value.caption)}</figcaption>` : ""}</figure>`;
@@ -27865,7 +27928,7 @@ var bindFunction = {
 };
 var liveViewFunction = {
   pure: false,
-  doc: "Create a reactive output derived from a FormulaSheet, Binding, or other observable source",
+  doc: "Deprecated compatibility wrapper for a reactive output derived from a subscribable source; prefer a named $$ output and final $ read",
   impl(args, context, evaluate) {
     if (args.length !== 2)
       throw new Error(".LiveView expects an observable source and one deferred body");
@@ -28074,8 +28137,10 @@ function normalizeDocumentView(value, path, shape) {
         fail(`${path}.axisLabels[${axis}]`, `must be null or contain exactly ${shape[axis]} labels`);
       }
       labels.forEach((label, index) => {
+        if (label === null)
+          return;
         if (typeof label !== "string" || label.length === 0) {
-          fail(`${path}.axisLabels[${axis}][${index}]`, "must be a non-empty string");
+          fail(`${path}.axisLabels[${axis}][${index}]`, "must be null or a non-empty string");
         }
       });
     });
@@ -28549,7 +28614,7 @@ function importDelimitedCapability(args, context, evaluate, systemContext, delim
       slotMetadata.set(`${rowIndex + 1},${columnIndex + 1}`, {
         source,
         assignmentMode: ":=",
-        view: field.startsWith("=") ? { foreignFormula: field, executable: false, format: delimiter === "," ? "csv" : "tsv" } : {}
+        view: field === "" ? { blank: true } : field.startsWith("=") ? { foreignFormula: field, executable: false, format: delimiter === "," ? "csv" : "tsv" } : {}
       });
     }
   }
@@ -28559,7 +28624,9 @@ function importDelimitedCapability(args, context, evaluate, systemContext, delim
     slotMetadata,
     documentView: {
       axes: ["row", "column"],
-      ...headers ? { axisLabels: [null, headers] } : {}
+      ...headers ? {
+        axisLabels: [null, headers.map((header) => header === "" ? null : header)]
+      } : {}
     }
   });
 }
@@ -30848,6 +30915,15 @@ function moveSheetSelection(position, key, rowCount, columnCount) {
 function sheetPlaneKey2(selections) {
   return [...selections].sort((left, right) => Number(left.axis) - Number(right.axis)).map(({ axis, value }) => `${Number(axis)}:${Number(value)}`).join(",");
 }
+var RIXCEL_FORMULA_CLIPBOARD_TYPE = "application/x-rixcel-formula";
+function parseSheetFormulaClipboard(text4, fallbackAssignmentMode = ":=") {
+  const source = String(text4 ?? "");
+  const match = source.match(/^\s*(::=|~~=|:=|~=|=)\s*([\s\S]+)$/u);
+  return Object.freeze({
+    source: match ? match[2] : source,
+    assignmentMode: match?.[1] ?? fallbackAssignmentMode
+  });
+}
 function sheetRoots(root) {
   if (!root)
     return [];
@@ -30895,6 +30971,7 @@ function enhanceSheet(sheet, options) {
   const editLabel = editForm?.querySelector("[data-rix-edit-label]");
   const editValue = editForm?.querySelector("[data-rix-edit-value]");
   const editStatus = editForm?.querySelector("[data-rix-edit-status]");
+  const editableHeaders = [...sheet.querySelectorAll("th[data-rix-header-axis][data-rix-header-coordinate]")];
   let selectedCell = null;
   if (editForm && typeof options.onEdit === "function")
     editForm.hidden = false;
@@ -30957,6 +31034,32 @@ function enhanceSheet(sheet, options) {
     editInput.select();
     return true;
   }
+  function pasteInto(cell, clipboardData) {
+    if (!editInput || typeof options.onEdit !== "function")
+      return false;
+    let formula = null;
+    const encoded = clipboardData?.getData?.(RIXCEL_FORMULA_CLIPBOARD_TYPE);
+    if (encoded) {
+      try {
+        const value = JSON.parse(encoded);
+        if (typeof value.source === "string") {
+          formula = {
+            source: value.source,
+            assignmentMode: value.assignmentMode || ":="
+          };
+        }
+      } catch {
+        formula = null;
+      }
+    }
+    formula ??= parseSheetFormulaClipboard(clipboardData?.getData?.("text/plain") ?? "", ":=");
+    select(cell, { focus: false });
+    editInput.value = formula.source;
+    if (editAssignmentMode)
+      editAssignmentMode.value = formula.assignmentMode;
+    editForm.requestSubmit();
+    return true;
+  }
   function changePlane() {
     const selections = planeSelectors.map((selector2) => ({
       axis: Number(selector2.dataset.rixSheetAxis),
@@ -31003,6 +31106,25 @@ function enhanceSheet(sheet, options) {
         return;
       activate(cell);
     });
+    cell.addEventListener("copy", (event) => {
+      const source = cell.dataset.rixFormulaSource;
+      if (!event.clipboardData || source === undefined)
+        return;
+      event.clipboardData.setData("text/plain", `${cell.dataset.rixAssignmentMode || ":="} ${source}`);
+      event.clipboardData.setData(RIXCEL_FORMULA_CLIPBOARD_TYPE, JSON.stringify({
+        source,
+        assignmentMode: cell.dataset.rixAssignmentMode || ":="
+      }));
+      event.preventDefault();
+      dispatchSheetEvent(sheet, "rix-sheet-copy", eventDetail(cell));
+    });
+    cell.addEventListener("paste", (event) => {
+      if (!pasteInto(cell, event.clipboardData))
+        return;
+      event.preventDefault();
+      event.stopPropagation();
+      dispatchSheetEvent(sheet, "rix-sheet-paste", eventDetail(cell));
+    });
     cell.addEventListener("keydown", (event) => {
       if (event.key === "F2") {
         event.preventDefault();
@@ -31036,6 +31158,77 @@ function enhanceSheet(sheet, options) {
       if (target)
         select(target, { focus: true });
     });
+  }
+  if (typeof options.onHeaderEdit === "function") {
+    for (const header of editableHeaders) {
+      let editing = false;
+      const display = (label2) => label2 ? `${label2} · ${header.dataset.rixHeaderCoordinate}` : header.dataset.rixHeaderFallback;
+      const beginHeaderEdit = () => {
+        if (editing)
+          return;
+        editing = true;
+        header.dataset.rixHeaderPrevious = header.dataset.rixHeaderLabel || "";
+        header.textContent = header.dataset.rixHeaderLabel || "";
+        header.contentEditable = "true";
+        header.focus();
+        const selection = header.ownerDocument?.defaultView?.getSelection?.();
+        const range = header.ownerDocument?.createRange?.();
+        if (selection && range) {
+          range.selectNodeContents(header);
+          selection.removeAllRanges();
+          selection.addRange(range);
+        }
+      };
+      const finishHeaderEdit = (commit) => {
+        if (!editing)
+          return;
+        editing = false;
+        header.contentEditable = "false";
+        const previous = header.dataset.rixHeaderPrevious || "";
+        const label2 = commit ? header.textContent.trim() : previous;
+        if (commit) {
+          const detail = {
+            axis: Number(header.dataset.rixHeaderAxis),
+            coordinate: Number(header.dataset.rixHeaderCoordinate),
+            label: label2
+          };
+          try {
+            const result = options.onHeaderEdit(detail, header, sheet);
+            if (result?.type === "error")
+              throw new Error(result.text);
+            for (const candidate of editableHeaders.filter((item) => item.dataset.rixHeaderAxis === header.dataset.rixHeaderAxis && item.dataset.rixHeaderCoordinate === header.dataset.rixHeaderCoordinate)) {
+              candidate.dataset.rixHeaderLabel = label2;
+              candidate.textContent = label2 ? `${label2} · ${candidate.dataset.rixHeaderCoordinate}` : candidate.dataset.rixHeaderFallback;
+            }
+            dispatchSheetEvent(sheet, "rix-sheet-header-edit", detail);
+          } catch {
+            header.dataset.rixHeaderLabel = previous;
+          }
+        }
+        header.textContent = display(header.dataset.rixHeaderLabel || "");
+        delete header.dataset.rixHeaderPrevious;
+      };
+      header.addEventListener("dblclick", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        beginHeaderEdit();
+      });
+      header.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          event.stopPropagation();
+          if (editing)
+            finishHeaderEdit(true);
+          else
+            beginHeaderEdit();
+        } else if (event.key === "Escape" && editing) {
+          event.preventDefault();
+          event.stopPropagation();
+          finishHeaderEdit(false);
+        }
+      });
+      header.addEventListener("blur", () => finishHeaderEdit(true));
+    }
   }
   for (const selector2 of planeSelectors)
     selector2.addEventListener("change", changePlane);
@@ -31083,6 +31276,10 @@ function enhanceSheet(sheet, options) {
             if (!candidate)
               continue;
             candidate.textContent = update.text;
+            if (update.blank)
+              candidate.dataset.rixBlank = "true";
+            else
+              delete candidate.dataset.rixBlank;
             if (typeof update.formulaSource === "string") {
               candidate.dataset.rixFormulaSource = update.formulaSource;
             }
@@ -31183,6 +31380,10 @@ class WidgetSession {
       throw new Error("Cannot dispatch to a disposed WidgetSession");
     if (!event)
       throw new Error("Unsupported widget event: missing type");
+    if (this.editMode === "formula" && event.type === "sheet:header") {
+      this.formulaSheet.setAxisLabel(event.axis, event.coordinate, event.label ?? null);
+      return this.widget;
+    }
     const index = normalizedIndex(event.index, this.widget.shape);
     if (this.editMode === "value" && event.type === "sheet:set") {
       this.binding.at(...index).set(event.value, {
@@ -31213,7 +31414,8 @@ class WidgetSession {
   cellUpdates(format = (value) => String(value ?? "")) {
     return this.widget.planes.flatMap((plane) => plane.cells.flatMap((row) => row.map((cell) => ({
       address: cell.address,
-      text: format(cell.value),
+      text: cell.blank === true ? "" : format(cell.value),
+      blank: cell.blank === true,
       formulaSource: cell.formulaSource,
       slotId: cell.slotId,
       assignmentMode: cell.assignmentMode
@@ -31304,6 +31506,17 @@ function mountOutputWidgets(root, value, options = {}) {
         onActivate: options.onActivate,
         onSelection: options.onSelection,
         onPlaneChange: options.onPlaneChange,
+        onHeaderEdit: widgetSession?.editMode === "formula" ? (detail) => {
+          try {
+            widgetSession.dispatch({ type: "sheet:header", ...detail });
+            return { type: "result", revision: widgetSession.revision };
+          } catch (error) {
+            return {
+              type: "error",
+              text: error instanceof Error ? error.message : String(error)
+            };
+          }
+        } : null,
         onEdit: widgetSession && (widgetSession.editMode === "formula" || typeof options.evaluateEdit === "function") ? (detail) => {
           try {
             let valueResult = null;
@@ -31462,9 +31675,9 @@ function bindModel(next, nextName, { resetHistory = true } = {}) {
     historyIndex = -1;
   }
   unsubscribe = model.subscribe((event) => {
-    if (event.type === "formula:commit") {
+    if (event.type === "formula:commit" || event.type === "formula:view") {
       remember();
-      setStatus(`Saved locally · epoch ${model.epoch}`);
+      setStatus(event.type === "formula:view" ? "Saved labels locally" : `Saved locally · epoch ${model.epoch}`);
     } else if (event.type === "formula:error") {
       setStatus(event.error?.message || "Formula error");
     }
@@ -31579,5 +31792,5 @@ try {
   setStatus("Local recovery failed; opened a new document");
 }
 
-//# debugId=493FEF919FC13E4764756E2164756E21
+//# debugId=C4A767338AA83CB264756E2164756E21
 //# sourceMappingURL=main.js.map

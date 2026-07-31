@@ -19,5 +19,6 @@ describe("RiXCel standalone app", () => {
         expect(source).toContain(".RiXCelImport(hosttext)");
         expect(source).toContain("localStorage.setItem");
         expect(source).toContain("model.subscribe");
+        expect(source).toContain('event.type === "formula:view"');
     });
 });

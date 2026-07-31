@@ -35,6 +35,9 @@ button { cursor: pointer; }
 .rix-output-sheet tr:last-child > * { border-bottom: 0; }
 .rix-output-sheet tr > *:last-child { border-right: 0; }
 .rix-output-sheet th { color: #486078; background: #edf3fa; font: 600 .72rem/1.3 system-ui, sans-serif; }
+.rix-output-sheet th.rix-sheet-header-editable { cursor: text; outline: 0; }
+.rix-output-sheet th.rix-sheet-header-editable:hover { background: #e4eaf7; }
+.rix-output-sheet th.rix-sheet-header-editable:focus { position: relative; z-index: 2; background: #eef2ff; box-shadow: inset 0 0 0 2px #8b5cf6; }
 .rix-output-sheet-corner { text-align: left !important; }
 .rix-output-sheet td { cursor: cell; outline: 0; }
 .rix-output-sheet td:hover { background: #f5f8fc; }
