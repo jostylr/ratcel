@@ -10622,7 +10622,8 @@ var runtimeDefaults = Object.freeze({
     permissions: Object.freeze(["IMPORTS"])
   }),
   capabilityGroups: Object.freeze({
-    Output: Object.freeze(["BIND", "LIVEVIEW", "TEXT", "PARAGRAPH", "HEADING", "FRAGMENT", "TABLE", "GRID", "SHEET", "FIGURE", "SLIDE", "SLIDES", "Algebra"]),
+    Output: Object.freeze(["BIND", "LIVEVIEW", "TEXT", "PARAGRAPH", "HEADING", "FRAGMENT", "TABLE", "GRID", "SHEET", "CONTROLPANEL", "FIGURE", "SLIDE", "SLIDES", "Algebra"]),
+    Controls: Object.freeze(["CONTROLPANEL", "Controls"]),
     Graphics: Object.freeze(["Graphics"]),
     Draw: Object.freeze(["draw"]),
     Plot: Object.freeze(["plot"]),
@@ -12059,6 +12060,7 @@ function nodeMethods() {
     ["GET", method("Get", ([target]) => target.get())],
     ["PEEK", method("Peek", ([target]) => target.peek())],
     ["SET", method("Set", ([target, value]) => target.set(value))],
+    ["REPLACEVALUE", method("ReplaceValue", ([target, value]) => target.replaceValue(value))],
     ["GETFORMULA", method("GetFormula", ([target]) => target.formula)],
     ["SETFORMULA", method("SetFormula", ([target, formula]) => target.setFormula(formula))],
     ["LIVE", method("Live", ([target]) => target.live())],
@@ -12161,6 +12163,9 @@ function createReactiveGraph(options = {}) {
         if (kind !== "source")
           throw new Error(`Reactive computed node ${name} cannot be set directly`);
         return graph.setSource(name, value, metadata);
+      },
+      replaceValue(value, metadata = null) {
+        return graph.replaceValue(name, value, metadata);
       },
       setFormula(formula, metadata = null) {
         if (kind !== "computed")
@@ -12538,6 +12543,24 @@ function createReactiveGraph(options = {}) {
         dirty: new Set([name]),
         sourceOverrides: new Map([[name, value]]),
         cause: { type: "reactive:set", name, metadata }
+      });
+      return value;
+    },
+    replaceValue(name, value, metadata = null) {
+      name = canonicalName(name);
+      const node = requireNode(name);
+      if (node.kind === "source")
+        return graph.setSource(name, value, metadata);
+      if (activeEpoch) {
+        throw new Error(options.formulaMutationError || "Reactive computations cannot change formulas during an epoch");
+      }
+      const formula = Object.freeze({
+        fn: "DEFER",
+        args: Object.freeze([value])
+      });
+      graph.setFormula(name, formula, {
+        ...metadata,
+        source: metadata?.source ?? null
       });
       return value;
     },
@@ -14838,6 +14861,10 @@ function get(entries2, name, fallback = null) {
   const canonical = String(name).toLowerCase();
   return entries2.has(canonical) ? entries2.get(canonical) : fallback;
 }
+function has(entries2, name) {
+  const canonical = String(name).toLowerCase();
+  return [...entries2.keys()].some((key) => String(key).toLowerCase() === canonical);
+}
 function optionalMap(value, label) {
   return value === null || value === undefined ? null : map(value, label);
 }
@@ -14894,6 +14921,138 @@ function exactNumber(value, label) {
   if (value instanceof Integer || value instanceof Rational)
     return value;
   throw new Error(`${label} must be an exact integer or rational`);
+}
+function exactRational(value, label) {
+  if (value instanceof Rational)
+    return value;
+  if (value instanceof Integer)
+    return new Rational(value);
+  throw new Error(`${label} must be an exact integer or rational`);
+}
+function positiveCount(value, label) {
+  if (!(value instanceof Integer) || value.value <= 0n) {
+    throw new Error(`${label} must be a positive integer`);
+  }
+  const count = Number(value.value);
+  if (!Number.isSafeInteger(count) || count > 1e4) {
+    throw new Error(`${label} must be at most 10000`);
+  }
+  return count;
+}
+function reactiveTarget(entry, name) {
+  const target = get(entry, "target");
+  if (!isReactiveNode(target)) {
+    throw new Error(`${name} target must be a reactive $$name identity`);
+  }
+  return target;
+}
+function exactScale(interval2, stepValue, stepsValue, name) {
+  if (!(interval2 instanceof RationalInterval)) {
+    throw new Error(`${name} interval must be a RiX interval such as 0:10`);
+  }
+  const low = interval2.low;
+  const high = interval2.high;
+  const span = high.subtract(low);
+  if (span.numerator === 0n)
+    throw new Error(`${name} interval endpoints must differ`);
+  if (stepValue !== null && stepsValue !== null) {
+    throw new Error(`${name} accepts either step or steps, not both`);
+  }
+  let steps;
+  let step;
+  if (stepsValue !== null) {
+    steps = positiveCount(stepsValue, `${name} steps`);
+    step = span.divide(new Integer(BigInt(steps)));
+  } else {
+    step = stepValue === null ? span.divide(new Integer(20n)) : exactRational(stepValue, `${name} step`);
+    if (step.numerator <= 0n)
+      throw new Error(`${name} step must be positive`);
+    const ratio = span.divide(step);
+    const count = ratio.numerator / ratio.denominator;
+    if (count < 1n || count > 10000n) {
+      throw new Error(`${name} step must produce between 1 and 10000 positions`);
+    }
+    steps = Number(count);
+  }
+  return { low, high, step, steps };
+}
+function scaleIndex(value, scale, label) {
+  const exact = exactRational(value, label);
+  const indexValue = exact.subtract(scale.low).divide(scale.step);
+  if (indexValue.denominator !== 1n) {
+    const stepKind = label.includes("Slider") ? "slider" : "control";
+    throw new Error(`${label} must lie on an exact ${stepKind} step`);
+  }
+  const index = Number(indexValue.numerator);
+  if (!Number.isSafeInteger(index) || index < 0 || index > scale.steps) {
+    throw new Error(`${label} must lie within its interval`);
+  }
+  return index;
+}
+function controlValuesEqual(left, right) {
+  if (left === right)
+    return true;
+  if ((left instanceof Integer || left instanceof Rational) && (right instanceof Integer || right instanceof Rational)) {
+    const a = exactRational(left, "Control value");
+    const b = exactRational(right, "Control value");
+    return a.numerator === b.numerator && a.denominator === b.denominator;
+  }
+  if (left instanceof RationalInterval && right instanceof RationalInterval) {
+    return controlValuesEqual(left.start, right.start) && controlValuesEqual(left.end, right.end);
+  }
+  const leftString = asString(left);
+  const rightString = asString(right);
+  if (leftString !== null || rightString !== null)
+    return leftString === rightString;
+  return false;
+}
+function invokeControlCallable(callable, args, runtime, label) {
+  if (runtime?.invoke)
+    return runtime.invoke(callable, args, runtime.context, runtime.evaluate);
+  if (typeof callable === "function")
+    return callable(...args);
+  throw new Error(`${label} must be a RiX callable`);
+}
+function controlDisplay(entry, fields, name, runtime, allowed = Object.keys(fields)) {
+  const formatValue = get(entry, "format");
+  if (formatValue === null)
+    return Object.freeze({ ...fields });
+  const formatters = map(formatValue, `${name} format`);
+  const display = { ...fields };
+  for (const [rawKey, formatter] of formatters) {
+    const key = String(rawKey).toLowerCase();
+    if (!allowed.includes(key)) {
+      throw new Error(`${name} format key '${rawKey}' is not one of ${allowed.join(", ")}`);
+    }
+    if (!Object.hasOwn(fields, key))
+      continue;
+    if (formatter !== null) {
+      display[key] = invokeControlCallable(formatter, [fields[key]], runtime, `${name} formatter '${rawKey}'`);
+    }
+  }
+  return Object.freeze(display);
+}
+function controlBehavior(entry, fields, name, runtime, allowed = Object.keys(fields)) {
+  const formatValue = get(entry, "format");
+  const formatKeys = formatValue === null ? [] : [...map(formatValue, `${name} format`).keys()].map((key) => String(key).toLowerCase());
+  const validate = get(entry, "validate");
+  const validateCandidate = validate === null ? null : (candidate) => {
+    const result = invokeControlCallable(validate, [candidate], runtime, `${name} validator`);
+    if (result === null || result === undefined)
+      return null;
+    const message = asString(result);
+    if (message === null)
+      throw new Error(`${name} validator must return _ or an error string`);
+    return message;
+  };
+  return {
+    display: controlDisplay(entry, fields, name, runtime, allowed),
+    formatKeys: Object.freeze(formatKeys),
+    disabled: has(entry, "disabled") && get(entry, "disabled") !== null,
+    readOnly: has(entry, "readOnly") && get(entry, "readOnly") !== null,
+    validation: validateCandidate?.(fields.value) ?? null,
+    validateCandidate
+  };
 }
 function numericValue(value, label) {
   if (value instanceof Integer)
@@ -14969,6 +15128,207 @@ function createGrid(args) {
     rows,
     rules: sequence(get(entry, "rules", { type: "sequence", values: [] }), "Grid rules"),
     style: optionalMap(get(entry, "style"), "Grid style")
+  });
+}
+function createSliderControl(args, runtime = null) {
+  const entry = spec(args, ["target", "interval", "step", "label"], "Controls.Slider");
+  const target = reactiveTarget(entry, "Controls.Slider");
+  const interval2 = get(entry, "interval");
+  const scale = exactScale(interval2, get(entry, "step"), get(entry, "steps"), "Controls.Slider");
+  const value = exactRational(target.get(), "Controls.Slider target value");
+  const index = scaleIndex(value, scale, "Controls.Slider target value");
+  return output("control_slider", {
+    id: asString(get(entry, "id")) || `${target.id}:slider`,
+    label: asString(get(entry, "label")) || target.name,
+    help: asString(get(entry, "help")),
+    target,
+    targetId: target.id,
+    value,
+    ...scale,
+    index,
+    ...controlBehavior(entry, { value, low: scale.low, high: scale.high, step: scale.step }, "Controls.Slider", runtime),
+    replacesDependencies: Object.freeze([...target.dependencies])
+  });
+}
+function createInputControl(args, runtime = null) {
+  const entry = spec(args, ["target", "label", "help", "placeholder"], "Controls.Input");
+  const target = reactiveTarget(entry, "Controls.Input");
+  const value = target.get();
+  return output("control_input", {
+    id: asString(get(entry, "id")) || `${target.id}:input`,
+    label: asString(get(entry, "label")) || target.name,
+    help: asString(get(entry, "help")),
+    placeholder: asString(get(entry, "placeholder")) || "RiX expression",
+    target,
+    targetId: target.id,
+    value,
+    ...controlBehavior(entry, { value }, "Controls.Input", runtime),
+    replacesDependencies: Object.freeze([...target.dependencies])
+  });
+}
+function normalizeChoiceOptions(value) {
+  return sequence(value, "Controls.Choice options").map((option, index) => {
+    if (option?.type !== "map")
+      return Object.freeze({ value: option, label: asString(option) });
+    const entries2 = map(option, `Controls.Choice option ${index + 1}`);
+    const optionValue = get(entries2, "value");
+    if (!has(entries2, "value"))
+      throw new Error(`Controls.Choice option ${index + 1} requires value`);
+    return Object.freeze({ value: optionValue, label: asString(get(entries2, "label")) });
+  });
+}
+function createChoiceControl(args, runtime = null) {
+  const entry = spec(args, ["target", "options", "label"], "Controls.Choice");
+  const target = reactiveTarget(entry, "Controls.Choice");
+  const options = normalizeChoiceOptions(get(entry, "options"));
+  if (options.length === 0)
+    throw new Error("Controls.Choice requires at least one option");
+  const value = target.get();
+  const index = options.findIndex((option) => controlValuesEqual(option.value, value));
+  if (index === -1)
+    throw new Error("Controls.Choice target value must match one of its options");
+  const displayOptions = options.map((option) => option.label === null ? controlDisplay(entry, { option: option.value }, "Controls.Choice", runtime, ["value", "option"]).option : option.label);
+  return output("control_choice", {
+    id: asString(get(entry, "id")) || `${target.id}:choice`,
+    label: asString(get(entry, "label")) || target.name,
+    help: asString(get(entry, "help")),
+    target,
+    targetId: target.id,
+    value,
+    options: Object.freeze(options),
+    displayOptions: Object.freeze(displayOptions),
+    index,
+    ...controlBehavior(entry, { value }, "Controls.Choice", runtime, ["value", "option"]),
+    replacesDependencies: Object.freeze([...target.dependencies])
+  });
+}
+function createToggleControl(args, runtime = null) {
+  const entry = spec(args, ["target", "off", "on", "label"], "Controls.Toggle");
+  const target = reactiveTarget(entry, "Controls.Toggle");
+  const off = get(entry, "off");
+  const on = get(entry, "on");
+  if (!has(entry, "off") || !has(entry, "on"))
+    throw new Error("Controls.Toggle requires explicit off and on values");
+  const value = target.get();
+  const index = controlValuesEqual(value, off) ? 0 : controlValuesEqual(value, on) ? 1 : -1;
+  if (index === -1)
+    throw new Error("Controls.Toggle target value must match its off or on value");
+  return output("control_toggle", {
+    id: asString(get(entry, "id")) || `${target.id}:toggle`,
+    label: asString(get(entry, "label")) || target.name,
+    help: asString(get(entry, "help")),
+    target,
+    targetId: target.id,
+    value,
+    values: Object.freeze([off, on]),
+    index,
+    ...controlBehavior(entry, { value, off, on }, "Controls.Toggle", runtime),
+    replacesDependencies: Object.freeze([...target.dependencies])
+  });
+}
+function createRangeControl(args, runtime = null) {
+  const entry = spec(args, ["target", "interval", "step", "label"], "Controls.Range");
+  const target = reactiveTarget(entry, "Controls.Range");
+  const scale = exactScale(get(entry, "interval"), get(entry, "step"), get(entry, "steps"), "Controls.Range");
+  const value = target.get();
+  if (!(value instanceof RationalInterval))
+    throw new Error("Controls.Range target value must be an exact RiX interval");
+  const indices = Object.freeze([
+    scaleIndex(value.low, scale, "Controls.Range lower endpoint"),
+    scaleIndex(value.high, scale, "Controls.Range upper endpoint")
+  ]);
+  return output("control_range", {
+    id: asString(get(entry, "id")) || `${target.id}:range`,
+    label: asString(get(entry, "label")) || target.name,
+    help: asString(get(entry, "help")),
+    target,
+    targetId: target.id,
+    value,
+    ...scale,
+    indices,
+    ...controlBehavior(entry, {
+      value,
+      start: value.start,
+      end: value.end,
+      low: scale.low,
+      high: scale.high,
+      step: scale.step
+    }, "Controls.Range", runtime),
+    replacesDependencies: Object.freeze([...target.dependencies])
+  });
+}
+function createResetControl(args, runtime = null) {
+  const entry = spec(args, ["target", "initial", "label"], "Controls.Reset");
+  const target = reactiveTarget(entry, "Controls.Reset");
+  const initial = get(entry, "initial");
+  if (!has(entry, "initial"))
+    throw new Error("Controls.Reset requires an explicit initial value snapshot");
+  const value = target.get();
+  return output("control_reset", {
+    id: asString(get(entry, "id")) || `${target.id}:reset`,
+    label: asString(get(entry, "label")) || `Reset ${target.name}`,
+    help: asString(get(entry, "help")),
+    target,
+    targetId: target.id,
+    value,
+    initial,
+    ...controlBehavior(entry, { value, initial }, "Controls.Reset", runtime),
+    replacesDependencies: Object.freeze([...target.dependencies])
+  });
+}
+function createControlPanel(args) {
+  const entry = spec(args, ["controls", "title", "description"], "ControlPanel");
+  const controls = sequence(get(entry, "controls"), "ControlPanel controls");
+  if (!controls.every((control) => isOutputValue(control) && control.kind.startsWith("control_"))) {
+    throw new Error("ControlPanel entries must be values created by .Controls");
+  }
+  const mode = (asString(get(entry, "mode")) || "immediate").toLowerCase();
+  if (!["immediate", "staged"].includes(mode)) {
+    throw new Error("ControlPanel mode must be :immediate or :staged");
+  }
+  if (mode === "staged") {
+    const graphs = new Set(controls.map(({ target }) => target?.graph).filter(Boolean));
+    if (graphs.size > 1)
+      throw new Error("A staged ControlPanel cannot span ReactiveGraphs");
+  }
+  return output("control_panel", {
+    controls: Object.freeze([...controls]),
+    title: asString(get(entry, "title")),
+    description: asString(get(entry, "description")),
+    mode,
+    submitLabel: asString(get(entry, "submitLabel")) || "Apply changes",
+    discardLabel: asString(get(entry, "discardLabel")) || "Discard",
+    interactive: true,
+    metadata: optionalMap(get(entry, "metadata"), "ControlPanel metadata")
+  }, [["SNAPSHOT", method3("Snapshot", ([target]) => createControlPanelSnapshot(target))]]);
+}
+function controlSnapshot(control) {
+  const {
+    target: _target,
+    validateCandidate: _validateCandidate,
+    _ext: _extensions,
+    ...fields
+  } = control;
+  return output(control.kind, {
+    ...fields,
+    target: null,
+    disabled: true,
+    readOnly: true
+  });
+}
+function createControlPanelSnapshot(panel) {
+  if (!isOutputValue(panel) || panel.kind !== "control_panel") {
+    throw new Error("Expected a ControlPanel output value");
+  }
+  return output("control_panel", {
+    controls: Object.freeze(panel.controls.map(controlSnapshot)),
+    title: panel.title,
+    description: panel.description,
+    mode: "immediate",
+    submitLabel: panel.submitLabel,
+    discardLabel: panel.discardLabel,
+    interactive: false,
+    metadata: panel.metadata
   });
 }
 function sheetData(value) {
@@ -15346,8 +15706,8 @@ function createCircle(args) {
 function createDragPoint(args) {
   const entry = spec(args, ["target", "radius", "style", "label"], "DragPoint");
   const target = get(entry, "target");
-  if (!isReactiveNode(target) || target.kind !== "source") {
-    throw new Error("DragPoint target must be a ReactiveGraph source node");
+  if (!isReactiveNode(target)) {
+    throw new Error("DragPoint target must be a ReactiveGraph node");
   }
   const center = sequence(target.get(), "DragPoint target value");
   if (center.length !== 2) {
@@ -15359,7 +15719,8 @@ function createDragPoint(args) {
     style: optionalMap(get(entry, "style"), "DragPoint style"),
     label: asString(get(entry, "label")) || "Draggable point",
     target,
-    targetId: target.id
+    targetId: target.id,
+    replacesDependencies: Object.freeze([...target.dependencies])
   });
 }
 function createClip(args) {
@@ -15489,6 +15850,22 @@ function escapeHtml(value) {
 }
 function cellText(value, format) {
   return value === null || value === undefined ? "" : format(value);
+}
+function controlField(control, name) {
+  return control.display && Object.hasOwn(control.display, name) ? control.display[name] : control[name];
+}
+function controlStateAttributes(control) {
+  return `${control.disabled ? ' data-rix-control-disabled="true"' : ""}${control.readOnly ? ' data-rix-control-read-only="true"' : ""}`;
+}
+function controlInputAttributes(control, { text: text4 = false } = {}) {
+  if (control.disabled)
+    return " disabled";
+  if (control.readOnly)
+    return text4 ? ' readonly aria-readonly="true"' : ' aria-readonly="true"';
+  return "";
+}
+function controlMessages(control) {
+  return `${control.validation ? `<small class="rix-output-control-validation" role="alert">${escapeHtml(control.validation)}</small>` : ""}${control.help ? `<small>${escapeHtml(control.help)}</small>` : ""}`;
 }
 function ruleField(rule, name) {
   if (rule?.type === "map" && rule.entries instanceof Map)
@@ -15656,7 +16033,8 @@ function renderSvgNode(node, format, defs) {
   }
   if (node.kind === "drag_point") {
     const [cx, cy] = svgPair(node.center, "DragPoint center");
-    return `<circle class="rix-output-drag-point" cx="${cx}" cy="${cy}" r="${svgNumber(node.radius, "DragPoint radius")}" ${svgStyle(node.style, "#7c3aed")} tabindex="0" role="button" aria-label="${escapeHtml(node.label)}" data-rix-drag-target="${escapeHtml(node.targetId)}" data-rix-position="${cx},${cy}"/>`;
+    const replaced = node.replacesDependencies?.length ? ` data-rix-replaces-dependencies="${escapeHtml(node.replacesDependencies.join(","))}"` : "";
+    return `<circle class="rix-output-drag-point" cx="${cx}" cy="${cy}" r="${svgNumber(node.radius, "DragPoint radius")}" ${svgStyle(node.style, "#7c3aed")} tabindex="0" role="button" aria-label="${escapeHtml(node.label)}" data-rix-drag-target="${escapeHtml(node.targetId)}" data-rix-position="${cx},${cy}"${replaced}/>`;
   }
   if (node.kind === "text_mark")
     return renderSvgText(node, format);
@@ -15724,6 +16102,28 @@ function formatOutputText(value, format) {
     return value.children.map((child) => formatOutputText(child, format)).join(`
 
 `);
+  if (value.kind === "control_slider") {
+    return `${value.label}: ${cellText(controlField(value, "value"), format)} (${cellText(controlField(value, "low"), format)} … ${cellText(controlField(value, "high"), format)}; step ${cellText(controlField(value, "step"), format)})`;
+  }
+  if (value.kind === "control_input")
+    return `${value.label}: ${cellText(controlField(value, "value"), format)}`;
+  if (value.kind === "control_choice") {
+    return `${value.label}: ${cellText(controlField(value, "value"), format)}`;
+  }
+  if (value.kind === "control_toggle") {
+    return `${value.label}: ${cellText(controlField(value, "value"), format)} (${cellText(controlField(value, "off"), format)} ↔ ${cellText(controlField(value, "on"), format)})`;
+  }
+  if (value.kind === "control_range") {
+    const current = value.formatKeys.includes("value") ? cellText(controlField(value, "value"), format) : `${cellText(controlField(value, "start"), format)} … ${cellText(controlField(value, "end"), format)}`;
+    return `${value.label}: ${current} within ${cellText(controlField(value, "low"), format)} … ${cellText(controlField(value, "high"), format)}; step ${cellText(controlField(value, "step"), format)}`;
+  }
+  if (value.kind === "control_reset") {
+    return `${value.label}: ${cellText(controlField(value, "value"), format)} → ${cellText(controlField(value, "initial"), format)}`;
+  }
+  if (value.kind === "control_panel") {
+    return [value.title, value.description, ...value.controls.map((control) => formatOutputText(control, format))].filter(Boolean).join(`
+`);
+  }
   if (value.kind === "table") {
     const strings = value.rows.map((row) => row.map((cell) => cellText(cell, format)));
     const widths = value.columns.map((column, index) => Math.max(column.label.length, ...strings.map((row) => row[index].length)));
@@ -15778,6 +16178,36 @@ function renderOutputHtml(value, format = (item) => String(item ?? "")) {
     return `<h${value.level} class="rix-output-heading">${text4(value.content)}</h${value.level}>`;
   if (value.kind === "fragment")
     return `<section class="rix-output-fragment">${value.children.map((child) => renderOutputHtml(child, format)).join("")}</section>`;
+  if (value.kind === "control_slider") {
+    const dependencies = value.replacesDependencies.length > 0 ? ` data-rix-replaces-dependencies="${escapeHtml(value.replacesDependencies.join(","))}"` : "";
+    return `<label class="rix-output-control rix-output-control-slider" data-rix-control-kind="slider" data-rix-control-id="${escapeHtml(value.id)}" data-rix-control-target="${escapeHtml(value.targetId)}"${controlStateAttributes(value)}${dependencies}><span class="rix-output-control-label">${escapeHtml(value.label)}</span><input type="range" min="0" max="${value.steps}" step="1" value="${value.index}" data-rix-control-input aria-label="${escapeHtml(value.label)}"${controlInputAttributes(value)}><output data-rix-control-value>${text4(controlField(value, "value"))}</output><small class="rix-output-control-scale">${text4(controlField(value, "low"))} … ${text4(controlField(value, "high"))} · step ${text4(controlField(value, "step"))}</small>${controlMessages(value)}</label>`;
+  }
+  if (value.kind === "control_input") {
+    const dependencies = value.replacesDependencies.length > 0 ? ` data-rix-replaces-dependencies="${escapeHtml(value.replacesDependencies.join(","))}"` : "";
+    return `<label class="rix-output-control rix-output-control-input" data-rix-control-kind="input" data-rix-control-id="${escapeHtml(value.id)}" data-rix-control-target="${escapeHtml(value.targetId)}"${controlStateAttributes(value)}${dependencies}><span class="rix-output-control-label">${escapeHtml(value.label)}</span><span class="rix-output-control-input-row"><input type="text" value="${text4(controlField(value, "value"))}" placeholder="${escapeHtml(value.placeholder)}" data-rix-control-input aria-label="${escapeHtml(value.label)}"${controlInputAttributes(value, { text: true })}><button type="button" data-rix-control-commit${controlInputAttributes(value)}>Set</button></span><output data-rix-control-value>${text4(controlField(value, "value"))}</output>${controlMessages(value)}</label>`;
+  }
+  if (value.kind === "control_choice") {
+    const dependencies = value.replacesDependencies.length > 0 ? ` data-rix-replaces-dependencies="${escapeHtml(value.replacesDependencies.join(","))}"` : "";
+    const options = value.options.map((option, index) => `<option value="${index}"${index === value.index ? " selected" : ""}>${escapeHtml(cellText(value.displayOptions[index], format))}</option>`).join("");
+    return `<label class="rix-output-control rix-output-control-choice" data-rix-control-kind="choice" data-rix-control-id="${escapeHtml(value.id)}" data-rix-control-target="${escapeHtml(value.targetId)}"${controlStateAttributes(value)}${dependencies}><span class="rix-output-control-label">${escapeHtml(value.label)}</span><select data-rix-control-input aria-label="${escapeHtml(value.label)}"${controlInputAttributes(value)}>${options}</select><output data-rix-control-value>${text4(controlField(value, "value"))}</output>${controlMessages(value)}</label>`;
+  }
+  if (value.kind === "control_toggle") {
+    const dependencies = value.replacesDependencies.length > 0 ? ` data-rix-replaces-dependencies="${escapeHtml(value.replacesDependencies.join(","))}"` : "";
+    return `<label class="rix-output-control rix-output-control-toggle" data-rix-control-kind="toggle" data-rix-control-id="${escapeHtml(value.id)}" data-rix-control-target="${escapeHtml(value.targetId)}"${controlStateAttributes(value)}${dependencies}><span class="rix-output-control-label">${escapeHtml(value.label)}</span><input type="checkbox"${value.index === 1 ? " checked" : ""} data-rix-control-input aria-label="${escapeHtml(value.label)}"${controlInputAttributes(value)}><output data-rix-control-value>${text4(controlField(value, "value"))}</output><small class="rix-output-control-scale">${text4(controlField(value, "off"))} ↔ ${text4(controlField(value, "on"))}</small>${controlMessages(value)}</label>`;
+  }
+  if (value.kind === "control_range") {
+    const dependencies = value.replacesDependencies.length > 0 ? ` data-rix-replaces-dependencies="${escapeHtml(value.replacesDependencies.join(","))}"` : "";
+    const current = value.formatKeys.includes("value") ? text4(controlField(value, "value")) : `${text4(controlField(value, "start"))} … ${text4(controlField(value, "end"))}`;
+    return `<fieldset class="rix-output-control rix-output-control-range" data-rix-control-kind="range" data-rix-control-id="${escapeHtml(value.id)}" data-rix-control-target="${escapeHtml(value.targetId)}"${controlStateAttributes(value)}${dependencies}><legend class="rix-output-control-label">${escapeHtml(value.label)}</legend><span class="rix-output-control-range-inputs"><input type="range" min="0" max="${value.steps}" step="1" value="${value.indices[0]}" data-rix-control-input data-rix-control-endpoint="low" aria-label="${escapeHtml(value.label)} lower endpoint"${controlInputAttributes(value)}><input type="range" min="0" max="${value.steps}" step="1" value="${value.indices[1]}" data-rix-control-input data-rix-control-endpoint="high" aria-label="${escapeHtml(value.label)} upper endpoint"${controlInputAttributes(value)}></span><output data-rix-control-value>${current}</output><small class="rix-output-control-scale">${text4(controlField(value, "low"))} … ${text4(controlField(value, "high"))} · step ${text4(controlField(value, "step"))}</small>${controlMessages(value)}</fieldset>`;
+  }
+  if (value.kind === "control_reset") {
+    const dependencies = value.replacesDependencies.length > 0 ? ` data-rix-replaces-dependencies="${escapeHtml(value.replacesDependencies.join(","))}"` : "";
+    return `<div class="rix-output-control rix-output-control-reset" data-rix-control-kind="reset" data-rix-control-id="${escapeHtml(value.id)}" data-rix-control-target="${escapeHtml(value.targetId)}"${controlStateAttributes(value)}${dependencies}><span class="rix-output-control-label">${escapeHtml(value.label)}</span><button type="button" data-rix-control-input aria-label="${escapeHtml(value.label)}"${controlInputAttributes(value)}>Reset to ${text4(controlField(value, "initial"))}</button><output data-rix-control-value>${text4(controlField(value, "value"))}</output>${controlMessages(value)}</div>`;
+  }
+  if (value.kind === "control_panel") {
+    const actions = value.mode === "staged" ? `<div class="rix-output-control-actions"><button type="button" data-rix-control-submit disabled>${escapeHtml(value.submitLabel)}</button><button type="button" data-rix-control-discard disabled>${escapeHtml(value.discardLabel)}</button></div>` : "";
+    return `<section class="rix-output-control-panel" data-rix-interactive="${value.interactive === false ? "false" : "true"}" data-rix-control-mode="${escapeHtml(value.mode || "immediate")}">${value.title ? `<h3>${escapeHtml(value.title)}</h3>` : ""}${value.description ? `<p>${escapeHtml(value.description)}</p>` : ""}<div class="rix-output-control-list">${value.controls.map((control) => renderOutputHtml(control, format)).join("")}</div>${actions}<output class="rix-output-control-status" aria-live="polite"></output></section>`;
+  }
   if (value.kind === "table")
     return `<table class="rix-output-table">${value.caption ? `<caption>${escapeHtml(value.caption)}</caption>` : ""}<thead><tr>${value.columns.map((column) => `<th>${escapeHtml(column.label)}</th>`).join("")}</tr></thead><tbody>${value.rows.map((row) => `<tr>${row.map((cell) => `<td>${text4(cell)}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
   if (value.kind === "grid")
@@ -15811,7 +16241,11 @@ function renderOutputHtml(value, format = (item) => String(item ?? "")) {
     return `<figure class="rix-output-figure"${value.label ? ` id="${escapeHtml(value.label)}"` : ""}>${renderOutputHtml(value.content, format)}${value.caption ? `<figcaption>${escapeHtml(value.caption)}</figcaption>` : ""}</figure>`;
   if (value.kind === "graphic") {
     const interactive = graphicIsInteractive(value);
-    return `<div class="rix-output-graphic"${interactive ? ' data-rix-interactive="true"' : ""}>${renderGraphicSvg(value, format)}${interactive ? '<output class="rix-output-graphic-status" aria-live="polite">Drag the highlighted point or use its arrow keys.</output>' : ""}</div>`;
+    const replacesDependencies = interactive && value.children.some(function hasReplacement(node) {
+      return isOutputValue(node) && (node.kind === "drag_point" && node.replacesDependencies?.length > 0 || (node.children || []).some(hasReplacement));
+    });
+    const interactionStatus = replacesDependencies ? "Dragging will replace this point’s current reactive dependencies." : "Drag the highlighted point or use its arrow keys.";
+    return `<div class="rix-output-graphic"${interactive ? ' data-rix-interactive="true"' : ""}>${renderGraphicSvg(value, format)}${interactive ? `<output class="rix-output-graphic-status" aria-live="polite">${interactionStatus}</output>` : ""}</div>`;
   }
   if (value.kind === "slide")
     return `<section class="rix-output-slide">${value.title ? `<h2>${escapeHtml(value.title)}</h2>` : ""}${renderOutputHtml(value.content, format)}</section>`;
@@ -15855,6 +16289,32 @@ function createGraphicsOutputCollection() {
       type: "method_builtin",
       name,
       impl: (args) => constructor(args.slice(1))
+    });
+  }
+  return { type: "map", entries: entries2, _ext: extension };
+}
+function createControlsOutputCollection() {
+  const methods = new Map([
+    ["Slider", createSliderControl],
+    ["Input", createInputControl],
+    ["Choice", createChoiceControl],
+    ["Toggle", createToggleControl],
+    ["Range", createRangeControl],
+    ["Reset", createResetControl]
+  ]);
+  const entries2 = new Map;
+  const extension = new Map([["immutable", int3(1)]]);
+  for (const [name, constructor] of methods) {
+    entries2.set(name, constructor);
+    entries2.set(name.toUpperCase(), constructor);
+    extension.set(name.toUpperCase(), {
+      type: "method_builtin",
+      name,
+      impl: (args, context, evaluate, invoke) => constructor(args.slice(1), {
+        context,
+        evaluate,
+        invoke
+      })
     });
   }
   return { type: "map", entries: entries2, _ext: extension };
@@ -28071,6 +28531,7 @@ var outputFunctions = {
   FRAGMENT: capability(createFragment, "Compose portable output values"),
   TABLE: capability(createTable, "Create a structured output table"),
   GRID: capability(createGrid, "Create a mathematical layout grid"),
+  CONTROLPANEL: capability(createControlPanel, "Group reactive controls in a portable output panel"),
   SHEET: capability(createSheet, "Create a portable sheet view of indexable data"),
   FIGURE: capability(createFigure, "Wrap output with figure metadata"),
   SLIDE: capability(createSlide, "Create a presentation slide"),
@@ -30308,6 +30769,8 @@ function createDefaultSystemContext(options = {}) {
   ctx.registerValue("Algebra", algebra, { doc: "Algebra presentation helpers" });
   const graphics = createGraphicsOutputCollection();
   ctx.registerValue("Graphics", graphics, { doc: "Intrinsic portable 2D scene language" });
+  const controls = createControlsOutputCollection();
+  ctx.registerValue("Controls", controls, { doc: "Reactive control constructors" });
   ctx.registerAll(stdlibFunctions);
   ctx.registerAll(symbolicCapabilities);
   ctx.registerCallableValue("Poly", createPolySystemValue(), symbolicCapabilities.POLY, {
@@ -31685,12 +32148,14 @@ class GraphicWidgetSession {
     if (!target)
       throw new Error(`Unknown Graphic drag target: ${event.targetId || "missing target"}`);
     const value = graphicPoint(event.position);
-    target.set(value, {
+    const replacedDependencies = Object.freeze([...target.dependencies]);
+    target.replaceValue(value, {
       source: "widget",
       widgetKind: "graphic",
       eventType: "graphic:position",
       targetId: event.targetId,
-      inputSource: event.source ?? null
+      inputSource: event.source ?? null,
+      replacedDependencies
     });
     return value;
   }
@@ -31705,9 +32170,221 @@ class GraphicWidgetSession {
       unsubscribe?.();
   }
 }
+function panelControls(panel) {
+  if (!isOutputValue(panel) || panel.kind !== "control_panel") {
+    throw new Error("ControlPanelWidgetSession requires a ControlPanel output value");
+  }
+  const controls = new Map;
+  for (const control of panel.controls) {
+    if (control.kind.startsWith("control_") && isReactiveNode(control.target)) {
+      controls.set(control.id, control);
+      if (!controls.has(control.targetId))
+        controls.set(control.targetId, control);
+    }
+  }
+  if (controls.size === 0) {
+    throw new Error("A ControlPanel WidgetSession requires at least one reactive control");
+  }
+  return controls;
+}
+function sliderValue(control, index) {
+  const normalized = Number(index);
+  if (!Number.isInteger(normalized) || normalized < 0 || normalized > control.steps) {
+    throw new Error(`Control slider index must be between 0 and ${control.steps}`);
+  }
+  return control.low.add(control.step.multiply(new Integer(BigInt(normalized))));
+}
+function indexedValue(control, index, values, label2) {
+  const normalized = Number(index);
+  if (!Number.isInteger(normalized) || normalized < 0 || normalized >= values.length) {
+    throw new Error(`${label2} index must be between 0 and ${values.length - 1}`);
+  }
+  return values[normalized];
+}
+function rangeValue(control, indices) {
+  if (!Array.isArray(indices) || indices.length !== 2) {
+    throw new Error("Control range requires lower and upper indices");
+  }
+  const low = sliderValue(control, indices[0]);
+  const high = sliderValue(control, indices[1]);
+  if (low.greaterThan(high))
+    throw new Error("Control range lower endpoint must not exceed its upper endpoint");
+  return new RationalInterval(low, high);
+}
+function controlValue(control, event) {
+  if (control.kind === "control_slider")
+    return sliderValue(control, event.index);
+  if (control.kind === "control_choice") {
+    return indexedValue(control, event.index, control.options.map((option) => option.value), "Control choice");
+  }
+  if (control.kind === "control_toggle") {
+    return indexedValue(control, event.index, control.values, "Control toggle");
+  }
+  if (control.kind === "control_range")
+    return rangeValue(control, event.indices);
+  if (control.kind === "control_reset")
+    return control.initial;
+  if (control.kind === "control_input") {
+    if (!("value" in event))
+      throw new Error("Control input requires an evaluated RiX value");
+    return event.value;
+  }
+  throw new Error(`Unsupported ControlPanel control: ${control.kind}`);
+}
+function resolveControlEdit(controls, event) {
+  const control = controls.get(String(event?.controlId || event?.targetId || ""));
+  if (!control)
+    throw new Error(`Unknown ControlPanel target: ${event?.targetId || "missing target"}`);
+  if (event.controlId && event.targetId && String(event.targetId) !== control.targetId) {
+    throw new Error("ControlPanel control and target IDs do not match");
+  }
+  if (control.disabled)
+    throw new Error(`${control.label} is disabled`);
+  if (control.readOnly)
+    throw new Error(`${control.label} is read-only`);
+  const value = controlValue(control, event);
+  const validation = control.validateCandidate?.(value) ?? null;
+  if (validation)
+    throw new Error(validation);
+  return Object.freeze({
+    control,
+    event,
+    value,
+    replacedDependencies: Object.freeze([...control.target.dependencies])
+  });
+}
+function literalFormula(value) {
+  return Object.freeze({ fn: "DEFER", args: Object.freeze([value]) });
+}
+function commitControlEdits(edits) {
+  if (edits.length === 0)
+    return Object.freeze([]);
+  const graph = edits[0].control.target.graph;
+  if (!edits.every(({ control }) => control.target.graph === graph)) {
+    throw new Error("An atomic ControlPanel commit cannot span ReactiveGraphs");
+  }
+  const targets = new Set;
+  for (const { control } of edits) {
+    if (targets.has(control.targetId)) {
+      throw new Error(`An atomic ControlPanel commit contains target ${control.targetId} more than once`);
+    }
+    targets.add(control.targetId);
+  }
+  graph.applyBatch(edits.map(({ control, value }) => ({
+    kind: "update",
+    name: control.target.name,
+    formula: literalFormula(value)
+  })), {
+    type: "control:batch",
+    widgetKind: "control_panel",
+    targets: Object.freeze(edits.map(({ control }) => control.targetId)),
+    controls: Object.freeze(edits.map(({ control }) => control.id)),
+    replacedDependencies: Object.freeze(edits.map(({ replacedDependencies }) => replacedDependencies))
+  });
+  return Object.freeze(edits.map(({ value }) => value));
+}
+
+class ControlPanelWidgetSession {
+  constructor(widget, options = {}) {
+    this.widget = widget;
+    this.editMode = "control";
+    this.controls = panelControls(widget);
+    this.revision = 0;
+    this.staged = new Map;
+    this.onChange = typeof options.onChange === "function" ? options.onChange : null;
+    this.disposed = false;
+    this._unsubscribes = [...new Set([...this.controls.values()].map(({ target }) => target))].map((target) => target.subscribe((sourceEvent) => {
+      if (this.disposed)
+        return;
+      this.revision += 1;
+      this.onChange?.({
+        session: this,
+        widget: this.widget,
+        revision: this.revision,
+        sourceEvent,
+        controlEvent: sourceEvent
+      });
+    }));
+  }
+  dispatch(event) {
+    if (this.disposed)
+      throw new Error("Cannot dispatch to a disposed ControlPanelWidgetSession");
+    if (event?.type === "control:batch") {
+      if (!Array.isArray(event.changes))
+        throw new Error("ControlPanel batch requires a changes array");
+      const edits = event.changes.map((change) => resolveControlEdit(this.controls, {
+        ...change,
+        type: "control:set"
+      }));
+      return commitControlEdits(edits);
+    }
+    if (event?.type !== "control:set") {
+      throw new Error(`Unsupported ControlPanel widget event: ${event?.type || "missing type"}`);
+    }
+    const edit = resolveControlEdit(this.controls, event);
+    const { control, value, replacedDependencies } = edit;
+    control.target.replaceValue(value, {
+      source: "widget",
+      widgetKind: "control_panel",
+      controlKind: control.kind,
+      eventType: "control:set",
+      targetId: control.targetId,
+      inputSource: event.source ?? null,
+      replacedDependencies
+    });
+    return value;
+  }
+  stage(event) {
+    if (this.disposed)
+      throw new Error("Cannot stage in a disposed ControlPanelWidgetSession");
+    if (event?.type !== "control:set") {
+      throw new Error(`Unsupported staged ControlPanel event: ${event?.type || "missing type"}`);
+    }
+    const edit = resolveControlEdit(this.controls, event);
+    this.staged.set(edit.control.targetId, edit);
+    return edit.value;
+  }
+  commit() {
+    if (this.disposed)
+      throw new Error("Cannot commit a disposed ControlPanelWidgetSession");
+    const edits = [...this.staged.values()].map(({ event }) => resolveControlEdit(this.controls, event));
+    const values = commitControlEdits(edits);
+    this.staged.clear();
+    return values;
+  }
+  clearStage() {
+    if (this.disposed)
+      throw new Error("Cannot clear a disposed ControlPanelWidgetSession");
+    const count = this.staged.size;
+    this.staged.clear();
+    return count;
+  }
+  stagedChanges() {
+    return Object.freeze([...this.staged.values()].map(({ control, event, value }) => Object.freeze({
+      controlId: control.id,
+      targetId: control.targetId,
+      event,
+      value
+    })));
+  }
+  current() {
+    return this.widget;
+  }
+  dispose() {
+    if (this.disposed)
+      return;
+    this.disposed = true;
+    this.staged.clear();
+    for (const unsubscribe of this._unsubscribes.splice(0))
+      unsubscribe?.();
+  }
+}
 function createWidgetSession(widget, options = {}) {
   if (isOutputValue(widget) && widget.kind === "graphic") {
     return new GraphicWidgetSession(widget, options);
+  }
+  if (isOutputValue(widget) && widget.kind === "control_panel") {
+    return new ControlPanelWidgetSession(widget, options);
   }
   return new WidgetSession(widget, options);
 }
@@ -31869,6 +32546,242 @@ function enhanceGraphicViews(root, options = {}) {
     enhanceGraphic(graphic, options);
   return root;
 }
+// ../../rix/src/tools/control-panel-view.js
+function panelRoots(root) {
+  if (!root)
+    return [];
+  const roots = [];
+  if (root.matches?.(".rix-output-control-panel"))
+    roots.push(root);
+  if (root.querySelectorAll)
+    roots.push(...root.querySelectorAll(".rix-output-control-panel"));
+  return roots;
+}
+function dispatchControlEvent(panel, detail) {
+  const EventConstructor = panel.ownerDocument?.defaultView?.CustomEvent;
+  if (typeof EventConstructor !== "function")
+    return;
+  panel.dispatchEvent(new EventConstructor("rix-control-set", { bubbles: true, detail }));
+}
+function dispatchPanelEvent(panel, name, detail) {
+  const EventConstructor = panel.ownerDocument?.defaultView?.CustomEvent;
+  if (typeof EventConstructor !== "function")
+    return;
+  panel.dispatchEvent(new EventConstructor(name, { bubbles: true, detail }));
+}
+function enhancePanel(panel, options) {
+  if (panel.dataset.rixControlPanelEnhanced === "true")
+    return;
+  panel.dataset.rixControlPanelEnhanced = "true";
+  const status = panel.querySelector(".rix-output-control-status");
+  const controls = [...panel.querySelectorAll("[data-rix-control-target]")];
+  if (controls.length === 0 || typeof options.onSet !== "function")
+    return;
+  const stagedMode = panel.dataset.rixControlMode === "staged";
+  const submit = panel.querySelector("[data-rix-control-submit]");
+  const discard = panel.querySelector("[data-rix-control-discard]");
+  const stagedTargets = new Set;
+  const restoreControls = [];
+  const acceptControls = [];
+  const updateActions = () => {
+    const disabled = stagedTargets.size === 0;
+    if (submit)
+      submit.disabled = disabled;
+    if (discard)
+      discard.disabled = disabled;
+  };
+  for (const control of controls) {
+    const inputs = [...control.querySelectorAll?.("[data-rix-control-input]") || []];
+    const input = inputs[0] || control.querySelector("[data-rix-control-input]");
+    const value = control.querySelector("[data-rix-control-value]");
+    if (!input)
+      continue;
+    const kind = control.dataset.rixControlKind || "slider";
+    const label2 = input.getAttribute("aria-label") || "Control";
+    if (control.dataset.rixControlDisabled === "true" || control.dataset.rixControlReadOnly === "true") {
+      for (const blocked of inputs.length > 0 ? inputs : [input]) {
+        blocked.addEventListener("click", (event) => event.preventDefault?.());
+        blocked.addEventListener("keydown", (event) => event.preventDefault?.());
+      }
+      continue;
+    }
+    const identity = () => ({
+      type: "control:set",
+      ...control.dataset.rixControlId ? { controlId: control.dataset.rixControlId } : {},
+      targetId: control.dataset.rixControlTarget
+    });
+    let committed = inputs.length > 1 ? inputs.map((item) => item.value) : input.value;
+    let committedChecked = Boolean(input.checked);
+    let committedText = value?.textContent ?? "";
+    acceptControls.push(() => {
+      committed = inputs.length > 1 ? inputs.map((item) => item.value) : input.value;
+      committedChecked = Boolean(input.checked);
+      committedText = value?.textContent ?? "";
+    });
+    restoreControls.push(() => {
+      if (inputs.length > 1)
+        inputs.forEach((item, index) => {
+          item.value = committed[index];
+        });
+      else
+        input.value = committed;
+      input.checked = committedChecked;
+      if (value)
+        value.textContent = committedText;
+    });
+    const commit = (detail, sourceInput = input) => {
+      try {
+        const result = options.onSet(Object.freeze(detail), sourceInput, panel);
+        if (result?.type === "error")
+          throw new Error(result.text);
+        if (!result?.staged) {
+          committed = inputs.length > 1 ? inputs.map((item) => item.value) : input.value;
+          committedChecked = Boolean(input.checked);
+          if (result?.text !== undefined)
+            committedText = String(result.text);
+        } else {
+          stagedTargets.add(detail.targetId);
+          updateActions();
+        }
+        if (value && result?.text !== undefined)
+          value.textContent = result.text;
+        if (status)
+          status.textContent = result?.staged ? `${label2} staged as ${result?.text ?? input.value}` : `${label2} set to ${result?.text ?? input.value}`;
+        if (result?.staged) {
+          dispatchPanelEvent(panel, "rix-control-stage", { ...detail, revision: result?.revision ?? null });
+          options.onStaged?.(detail, result, sourceInput, panel);
+        } else {
+          dispatchControlEvent(panel, { ...detail, revision: result?.revision ?? null });
+          options.onSetCommitted?.(detail, result, sourceInput, panel);
+        }
+      } catch (error) {
+        if (inputs.length > 1)
+          inputs.forEach((item, index) => {
+            item.value = committed[index];
+          });
+        else
+          input.value = committed;
+        input.checked = committedChecked;
+        if (value)
+          value.textContent = committedText;
+        if (status)
+          status.textContent = error instanceof Error ? error.message : String(error);
+      }
+    };
+    if (kind === "input") {
+      const submit2 = () => commit({
+        ...identity(),
+        sourceText: input.value,
+        source: "text"
+      });
+      control.querySelector("[data-rix-control-commit]")?.addEventListener("click", submit2);
+      input.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter")
+          return;
+        event.preventDefault?.();
+        submit2();
+      });
+      continue;
+    }
+    if (kind === "reset") {
+      input.addEventListener("click", () => commit({
+        ...identity(),
+        source: "reset"
+      }));
+      continue;
+    }
+    if (kind === "choice") {
+      input.addEventListener("change", () => commit({
+        ...identity(),
+        index: Number(input.value),
+        source: "select"
+      }));
+      continue;
+    }
+    if (kind === "toggle") {
+      input.addEventListener("change", () => commit({
+        ...identity(),
+        index: input.checked ? 1 : 0,
+        source: "checkbox"
+      }));
+      continue;
+    }
+    if (kind === "range") {
+      const preview = () => {
+        if (status)
+          status.textContent = `${label2}: positions ${inputs.map((item) => item.value).join(" … ")}`;
+      };
+      for (const endpoint of inputs) {
+        endpoint.addEventListener("input", preview);
+        endpoint.addEventListener("change", () => commit({
+          ...identity(),
+          indices: inputs.map((item) => Number(item.value)),
+          endpoint: endpoint.dataset?.rixControlEndpoint ?? null,
+          source: "range"
+        }, endpoint));
+      }
+      continue;
+    }
+    input.addEventListener("input", () => {
+      if (status)
+        status.textContent = `${label2}: position ${input.value}`;
+    });
+    input.addEventListener("change", () => commit({
+      ...identity(),
+      index: Number(input.value),
+      source: "range"
+    }));
+  }
+  if (stagedMode && submit && typeof options.onSubmit === "function") {
+    submit.addEventListener("click", () => {
+      try {
+        const result = options.onSubmit(panel);
+        if (result?.type === "error")
+          throw new Error(result.text);
+        const count = stagedTargets.size;
+        for (const accept of acceptControls)
+          accept();
+        stagedTargets.clear();
+        updateActions();
+        if (status)
+          status.textContent = `${count} staged ${count === 1 ? "change" : "changes"} applied atomically`;
+        dispatchPanelEvent(panel, "rix-control-commit", {
+          count,
+          revision: result?.revision ?? null
+        });
+        options.onSubmitted?.(result, panel);
+      } catch (error) {
+        if (status)
+          status.textContent = error instanceof Error ? error.message : String(error);
+      }
+    });
+  }
+  if (stagedMode && discard && typeof options.onDiscard === "function") {
+    discard.addEventListener("click", () => {
+      try {
+        const result = options.onDiscard(panel);
+        if (result?.type === "error")
+          throw new Error(result.text);
+        for (const restore of restoreControls)
+          restore();
+        stagedTargets.clear();
+        updateActions();
+        if (status)
+          status.textContent = "Staged changes discarded";
+        dispatchPanelEvent(panel, "rix-control-discard", {});
+        options.onDiscarded?.(result, panel);
+      } catch (error) {
+        if (status)
+          status.textContent = error instanceof Error ? error.message : String(error);
+      }
+    });
+  }
+}
+function enhanceControlPanelViews(root, options = {}) {
+  for (const panel of panelRoots(root))
+    enhancePanel(panel, options);
+  return root;
+}
 // ../../rix/src/tools/output-widgets.js
 function childOutputs(value) {
   if (!isOutputValue(value))
@@ -31901,6 +32814,16 @@ function collectGraphics(value, graphics = []) {
       collectGraphics(child, graphics);
   return graphics;
 }
+function collectControlPanels(value, panels = []) {
+  if (!isOutputValue(value))
+    return panels;
+  if (value.kind === "control_panel")
+    panels.push(value);
+  else
+    for (const child of childOutputs(value))
+      collectControlPanels(child, panels);
+  return panels;
+}
 function renderedSheetRoots(root) {
   const roots = [];
   if (root?.matches?.(".rix-output-sheet"))
@@ -31917,6 +32840,14 @@ function renderedGraphicRoots(root) {
     roots.push(...root.querySelectorAll(".rix-output-graphic"));
   return roots;
 }
+function renderedControlPanelRoots(root) {
+  const roots = [];
+  if (root?.matches?.(".rix-output-control-panel"))
+    roots.push(root);
+  if (root?.querySelectorAll)
+    roots.push(...root.querySelectorAll(".rix-output-control-panel"));
+  return roots;
+}
 function editedAddress(widget, index) {
   return `${widget.addressBase}[${index.join(",")}]`;
 }
@@ -31931,6 +32862,50 @@ function restoreSheetFocus(root, request) {
     return false;
   cell.focus();
   return true;
+}
+function restoreGraphicFocus(root, request) {
+  if (!request)
+    return false;
+  const graphicRoot = renderedGraphicRoots(root)[request.graphicIndex];
+  if (!graphicRoot)
+    return false;
+  const handle = [...graphicRoot.querySelectorAll("[data-rix-drag-target]")].find((candidate) => candidate.dataset.rixDragTarget === request.targetId);
+  if (!handle)
+    return false;
+  handle.focus();
+  return true;
+}
+function restoreControlPanelFocus(root, request) {
+  if (!request)
+    return false;
+  const panelRoot = renderedControlPanelRoots(root)[request.panelIndex];
+  if (!panelRoot)
+    return false;
+  if (request.status) {
+    const status = panelRoot.querySelector?.(".rix-output-control-status");
+    if (status)
+      status.textContent = request.status;
+  }
+  if (request.action) {
+    const action = panelRoot.querySelector?.(`[data-rix-control-${request.action}]`);
+    if (!action)
+      return false;
+    action.focus();
+    return true;
+  }
+  const control = [...panelRoot.querySelectorAll("[data-rix-control-target]")].find((candidate) => candidate.dataset.rixControlTarget === request.targetId);
+  const input = request.endpoint ? [...control?.querySelectorAll?.("[data-rix-control-endpoint]") || []].find((candidate) => candidate.dataset.rixControlEndpoint === request.endpoint) : control?.querySelector?.("[data-rix-control-input]");
+  if (!input)
+    return false;
+  input.focus();
+  return true;
+}
+function restoreOutputFocus(root, request) {
+  if (request?.kind === "graphic")
+    return restoreGraphicFocus(root, request);
+  if (request?.kind === "control_panel")
+    return restoreControlPanelFocus(root, request);
+  return restoreSheetFocus(root, request);
 }
 function mountOutputWidgets(root, value, options = {}) {
   const format = options.format || ((item) => String(item ?? ""));
@@ -31984,6 +32959,7 @@ function mountOutputWidgets(root, value, options = {}) {
               valueResult = evaluated?.type === "result" ? evaluated.value : evaluated;
             }
             const focusRequest = {
+              kind: "sheet",
               sheetIndex: index,
               address: editedAddress(widgetSession.current(), detail.index)
             };
@@ -32043,6 +33019,12 @@ function mountOutputWidgets(root, value, options = {}) {
       widgetDisposers.push(() => widgetSession.dispose());
       enhanceGraphicViews(graphicRoot, {
         onPosition(detail) {
+          const focusRequest = {
+            kind: "graphic",
+            graphicIndex: index,
+            targetId: detail.targetId
+          };
+          pendingFocusRequest = focusRequest;
           try {
             const valueResult = widgetSession.dispatch(detail);
             return {
@@ -32056,9 +33038,112 @@ function mountOutputWidgets(root, value, options = {}) {
               text: error instanceof Error ? error.message : String(error),
               revision: widgetSession.revision
             };
+          } finally {
+            if (pendingFocusRequest === focusRequest)
+              pendingFocusRequest = null;
           }
         },
         onPositionCommitted: options.onGraphicPosition
+      });
+    }
+    const panelValues = collectControlPanels(outputValue);
+    const panelRoots2 = renderedControlPanelRoots(container);
+    for (const [index, panel] of panelValues.entries()) {
+      const panelRoot = panelRoots2[index];
+      if (!panelRoot)
+        continue;
+      let widgetSession;
+      try {
+        widgetSession = createWidgetSession(panel);
+      } catch {
+        continue;
+      }
+      widgetDisposers.push(() => widgetSession.dispose());
+      enhanceControlPanelViews(panelRoot, {
+        onSet(detail) {
+          const focusRequest = {
+            kind: "control_panel",
+            panelIndex: index,
+            targetId: detail.targetId,
+            endpoint: detail.endpoint ?? null
+          };
+          pendingFocusRequest = focusRequest;
+          try {
+            let event = detail;
+            if (typeof detail.sourceText === "string") {
+              const evaluate2 = options.evaluateControl || options.evaluateEdit;
+              if (typeof evaluate2 !== "function") {
+                throw new Error("This host cannot evaluate RiX control input");
+              }
+              const evaluated = evaluate2(detail.sourceText, {
+                mode: "control",
+                panel: widgetSession.current(),
+                targetId: detail.targetId
+              });
+              if (evaluated?.type === "error")
+                return evaluated;
+              const inputValue = evaluated?.type === "result" ? evaluated.value : evaluated;
+              event = { ...detail, value: inputValue };
+            }
+            const staged = panel.mode === "staged";
+            const valueResult = staged ? widgetSession.stage(event) : widgetSession.dispatch(event);
+            if (!staged) {
+              focusRequest.status = `Control value set to ${format(valueResult)}`;
+              restoreControlPanelFocus(container, focusRequest);
+            }
+            return {
+              type: "result",
+              value: valueResult,
+              text: format(valueResult),
+              revision: widgetSession.revision,
+              staged
+            };
+          } catch (error) {
+            return {
+              type: "error",
+              text: error instanceof Error ? error.message : String(error),
+              revision: widgetSession.revision
+            };
+          } finally {
+            if (pendingFocusRequest === focusRequest)
+              pendingFocusRequest = null;
+          }
+        },
+        onSubmit: panel.mode === "staged" ? () => {
+          const count = widgetSession.stagedChanges().length;
+          const focusRequest = {
+            kind: "control_panel",
+            panelIndex: index,
+            action: "submit",
+            status: `${count} staged ${count === 1 ? "change" : "changes"} applied atomically`
+          };
+          pendingFocusRequest = focusRequest;
+          try {
+            const values = widgetSession.commit();
+            return {
+              type: "result",
+              values,
+              revision: widgetSession.revision
+            };
+          } catch (error) {
+            return {
+              type: "error",
+              text: error instanceof Error ? error.message : String(error),
+              revision: widgetSession.revision
+            };
+          } finally {
+            if (pendingFocusRequest === focusRequest)
+              pendingFocusRequest = null;
+          }
+        } : null,
+        onDiscard: panel.mode === "staged" ? () => ({
+          type: "result",
+          count: widgetSession.clearStage(),
+          revision: widgetSession.revision
+        }) : null,
+        onSetCommitted: options.onControlSet,
+        onSubmitted: options.onControlSubmit,
+        onDiscarded: options.onControlDiscard
       });
     }
   }
@@ -32075,7 +33160,7 @@ function mountOutputWidgets(root, value, options = {}) {
         liveRoot.innerHTML = render(value.current);
         liveRoot.dataset.rixLiveRevision = String(value.revision);
         mountWidgets(liveRoot, value.current);
-        restoreSheetFocus(liveRoot, focusRequest);
+        restoreOutputFocus(liveRoot, focusRequest);
         options.onLiveChange?.(event, liveRoot);
       });
       disposers.push(unsubscribe);
@@ -32092,7 +33177,7 @@ function mountOutputWidgets(root, value, options = {}) {
       currentValue = nextValue;
       root.innerHTML = render(currentValue);
       mountWidgets(root, currentValue);
-      restoreSheetFocus(root, focusRequest);
+      restoreOutputFocus(root, focusRequest);
       options.onLiveChange?.(event, root);
     });
     disposers.push(unsubscribe);
@@ -32283,5 +33368,5 @@ try {
   setStatus("Local recovery failed; opened a new document");
 }
 
-//# debugId=FDF560F865511C9464756E2164756E21
+//# debugId=2732274B6E507DBB64756E2164756E21
 //# sourceMappingURL=main.js.map
