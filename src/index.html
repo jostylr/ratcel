@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="RiXCel — exact, formula-backed, tensor-aware sheets powered by RiX." />
+    <title>RiXCel</title>
+    <link rel="stylesheet" href="./assets/app.css" />
+  </head>
+  <body class="rixcel-app">
+    <header class="rixcel-header">
+      <div><b>RiXCel</b><span>exact reactive sheets powered by RiX</span></div>
+      <nav aria-label="Document commands">
+        <button type="button" data-action="new">New</button>
+        <button type="button" data-action="open">Open</button>
+        <button type="button" data-action="save">Save .rixcel</button>
+        <button type="button" data-action="export-csv">Export CSV</button>
+        <button type="button" data-action="export-tsv">Export TSV</button>
+      </nav>
+    </header>
+
+    <main class="rixcel-workspace">
+      <section class="rixcel-toolbar" aria-label="Editing tools">
+        <button type="button" data-action="undo" disabled>Undo</button>
+        <button type="button" data-action="redo" disabled>Redo</button>
+        <label><input type="checkbox" data-field="header" checked /> First imported row is a header</label>
+        <span id="document-name">Untitled.rixcel</span>
+        <output id="status" role="status" aria-live="polite">Ready</output>
+      </section>
+      <section id="sheet-host" class="rixcel-sheet-host" aria-label="RiXCel sheet"></section>
+    </main>
+
+    <input id="file-input" type="file" accept=".rixcel,.csv,.tsv,application/json,text/csv,text/tab-separated-values" hidden />
+    <script type="module" src="./assets/main.js"></script>
+  </body>
+</html>
