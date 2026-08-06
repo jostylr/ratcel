@@ -165,7 +165,10 @@ function tokenize(input) {
       break;
     }
     let token = null;
-    token = tryMatchComment(input, position);
+    token = tryMatchPostfixCheck(input, position);
+    if (!token) {
+      token = tryMatchComment(input, position);
+    }
     if (!token) {
       token = tryMatchNumber(input, position);
     }
@@ -183,6 +186,9 @@ function tokenize(input) {
     }
     if (!token) {
       token = tryMatchIdentifier(input, position);
+    }
+    if (!token) {
+      token = tryMatchCustomOperator(input, position);
     }
     if (!token) {
       token = tryMatchRegexLiteral(input, position);
@@ -218,6 +224,48 @@ function tokenize(input) {
     });
   }
   return tokens;
+}
+function tryMatchCustomOperator(input, position) {
+  if (!input.startsWith(":<", position))
+    return null;
+  let end = -1;
+  for (let cursor = position + 2;cursor < input.length; cursor += 1) {
+    if (input.startsWith(">:", cursor)) {
+      end = cursor;
+      break;
+    }
+    if (input[cursor] === ":")
+      return null;
+    if (/\s/u.test(input[cursor]))
+      break;
+  }
+  if (end < 0) {
+    const { line, col } = posToLineCol(input, position);
+    throw new Error(`Unclosed custom operator delimiter at line ${line}:${col}`);
+  }
+  const value = input.slice(position + 2, end);
+  if (!value || /[<>:\s]/u.test(value)) {
+    const { line, col } = posToLineCol(input, position);
+    throw new Error(`Invalid custom operator delimiter at line ${line}:${col}`);
+  }
+  const original = input.slice(position, end + 2);
+  return {
+    type: "CustomOperator",
+    original,
+    value,
+    pos: [position, position, end + 2]
+  };
+}
+function tryMatchPostfixCheck(input, position) {
+  const marker = input.slice(position, position + 3);
+  if (marker !== "##@" && marker !== "##:" && marker !== "##!")
+    return null;
+  return {
+    type: "Symbol",
+    original: marker,
+    value: marker,
+    pos: [position, position, position + marker.length]
+  };
 }
 function tryMatchComment(input, position) {
   const remaining = input.slice(position);
@@ -1052,6 +1100,236 @@ function tryMatchRegexLiteral(input, position) {
   };
 }
 
+// ../../rix/src/parser/custom-operators.js
+var BUILTIN_PRECEDENCE_BANDS = Object.freeze({
+  assignment: 10,
+  pipe: 20,
+  arrow: 25,
+  logical_or: 30,
+  logical_and: 40,
+  condition: 45,
+  equality: 50,
+  comparison: 60,
+  interval: 70,
+  conversion: 75,
+  additive: 80,
+  multiplicative: 90,
+  power: 100,
+  calculus: 115,
+  postfix: 120,
+  property: 130
+});
+var BAND_ALIASES = Object.freeze({
+  addition: "additive",
+  multiplication: "multiplicative",
+  exponentiation: "power",
+  exponential: "power",
+  logicalor: "logical_or",
+  logicaland: "logical_and"
+});
+var FIXITIES = new Set(["infix", "prefix", "postfix"]);
+var ASSOCIATIVITIES = new Set(["left", "right", "none"]);
+var RELATIONS = new Set(["above", "below"]);
+var OPERATOR_TOKEN = /^:<([^<>:\s]+)>:$/u;
+var WORD_TOKEN = /^:([\p{L}_][\p{L}\p{N}_-]*)$/u;
+var TARGET_TOKEN = /^(?:[\p{L}_][\p{L}\p{N}_]*|\.[\p{L}_][\p{L}\p{N}_]*\.[\p{L}_][\p{L}\p{N}_]*)$/u;
+function normalizedBand(name) {
+  const normalized = String(name).toLowerCase().replace(/-/g, "_");
+  return BAND_ALIASES[normalized] || normalized;
+}
+function relativePrecedence(band, relation) {
+  const value = BUILTIN_PRECEDENCE_BANDS[band];
+  if (value === undefined)
+    throw new Error(`Unknown precedence band ':${band}'`);
+  const boundaries = Array.from(new Set([
+    ...Object.values(BUILTIN_PRECEDENCE_BANDS),
+    95,
+    97,
+    99
+  ])).sort((left, right) => left - right);
+  const index = boundaries.indexOf(value);
+  if (relation === "above") {
+    const next = boundaries[index + 1];
+    if (next === undefined)
+      throw new Error(`Cannot place an operator above ':${band}'`);
+    return (value + next) / 2;
+  }
+  const previous = boundaries[index - 1];
+  if (previous === undefined)
+    throw new Error(`Cannot place an operator below ':${band}'`);
+  return (previous + value) / 2;
+}
+function declarationError(label, line, message) {
+  throw new Error(`${label}:${line}: ${message}`);
+}
+function normalizedIdentifier(name) {
+  const firstLetter = Array.from(String(name)).find((character) => /\p{L}/u.test(character));
+  if (!firstLetter)
+    return name;
+  return firstLetter === firstLetter.toUpperCase() ? String(name).toUpperCase() : String(name).toLowerCase();
+}
+function parseTarget(rawTarget, owner, label, line) {
+  if (!TARGET_TOKEN.test(rawTarget)) {
+    declarationError(label, line, `Invalid operator target '${rawTarget}'`);
+  }
+  if (rawTarget.startsWith(".")) {
+    const [, mount, method] = rawTarget.split(".");
+    return {
+      kind: "system-method",
+      mount: normalizedIdentifier(mount),
+      method: normalizedIdentifier(method)
+    };
+  }
+  if (owner?.pluginId) {
+    return {
+      kind: "plugin-method",
+      pluginId: owner.pluginId,
+      mount: owner.mount || null,
+      method: normalizedIdentifier(rawTarget)
+    };
+  }
+  return { kind: "function", name: normalizedIdentifier(rawTarget) };
+}
+function parseOperatorDeclarationLine(source, options = {}) {
+  const label = options.label || "OPS";
+  const line = options.line || 1;
+  const fields = String(source).trim().split(/\s+/).filter(Boolean);
+  let symbol = null;
+  let target = null;
+  let fixity = null;
+  let associativity = null;
+  let relation = null;
+  let band = null;
+  for (const field of fields) {
+    const operatorMatch = field.match(OPERATOR_TOKEN);
+    if (operatorMatch) {
+      if (symbol !== null)
+        declarationError(label, line, "Operator declaration has more than one :<...>: symbol");
+      symbol = operatorMatch[1];
+      continue;
+    }
+    const wordMatch = field.match(WORD_TOKEN);
+    if (wordMatch) {
+      const word = wordMatch[1].toLowerCase();
+      if (FIXITIES.has(word)) {
+        if (fixity !== null)
+          declarationError(label, line, "Operator declaration has more than one fixity");
+        fixity = word;
+      } else if (ASSOCIATIVITIES.has(word)) {
+        if (associativity !== null)
+          declarationError(label, line, "Operator declaration has more than one associativity");
+        associativity = word;
+      } else if (RELATIONS.has(word)) {
+        if (relation !== null)
+          declarationError(label, line, "Operator declaration has more than one precedence relation");
+        relation = word;
+      } else {
+        const candidate = normalizedBand(word);
+        if (!Object.hasOwn(BUILTIN_PRECEDENCE_BANDS, candidate)) {
+          declarationError(label, line, `Unknown operator modifier '${field}'`);
+        }
+        if (band !== null)
+          declarationError(label, line, "Operator declaration has more than one precedence band");
+        band = candidate;
+      }
+      continue;
+    }
+    if (target !== null)
+      declarationError(label, line, `Unexpected operator declaration field '${field}'`);
+    target = field;
+  }
+  if (symbol === null)
+    declarationError(label, line, "Operator declaration requires one :<...>: symbol");
+  if (target === null)
+    declarationError(label, line, "Operator declaration requires one function or method target");
+  if (fixity === null)
+    declarationError(label, line, "Operator declaration requires a fixity such as :infix");
+  if (fixity !== "infix")
+    declarationError(label, line, `Custom ${fixity} operators are not implemented yet`);
+  if (band === null)
+    declarationError(label, line, "Operator declaration requires a named precedence band");
+  if (associativity === null)
+    declarationError(label, line, "Operator declaration requires :left, :right, or :none");
+  const precedence = relation ? relativePrecedence(band, relation) : BUILTIN_PRECEDENCE_BANDS[band];
+  return Object.freeze({
+    symbol,
+    spelling: `:<${symbol}>:`,
+    target: Object.freeze(parseTarget(target, options.owner, label, line)),
+    fixity,
+    associativity,
+    precedence,
+    precedenceBand: band,
+    precedenceRelation: relation,
+    source: label,
+    line
+  });
+}
+function isOpsComment(token) {
+  return token?.type === "String" && token.kind === "comment" && /^\s*##ops##/i.test(token.original || "");
+}
+function extractOperatorDeclarations(tokens, options = {}) {
+  const definitions = new Map;
+  let reachedCode = false;
+  for (const token of tokens || []) {
+    if (token.type === "End")
+      break;
+    if (token.type !== "String" || token.kind !== "comment") {
+      reachedCode = true;
+      continue;
+    }
+    if (!isOpsComment(token))
+      continue;
+    if (reachedCode) {
+      throw new Error(`${options.label || "source"}: ##OPS## blocks must appear before executable code`);
+    }
+    const bodyStart = token.pos?.[1] || 0;
+    const firstLine = options.source ? options.source.slice(0, bodyStart).split(`
+`).length : 1;
+    const lines = String(token.value || "").replace(/\r/g, "").split(`
+`);
+    for (let index = 0;index < lines.length; index += 1) {
+      const text = lines[index].trim();
+      if (!text)
+        continue;
+      const definition = parseOperatorDeclarationLine(text, {
+        owner: options.owner,
+        label: options.label || "OPS",
+        line: firstLine + index
+      });
+      if (definitions.has(definition.symbol)) {
+        declarationError(options.label || "OPS", firstLine + index, `Duplicate operator '${definition.spelling}'`);
+      }
+      definitions.set(definition.symbol, definition);
+    }
+  }
+  return definitions;
+}
+function extractOperatorDeclarationsFromSource(source, options = {}) {
+  return extractOperatorDeclarations(tokenize(source), {
+    ...options,
+    source
+  });
+}
+function mergeOperatorDefinitions(...collections) {
+  const merged = new Map;
+  for (const collection of collections) {
+    if (!collection)
+      continue;
+    const entries = collection instanceof Map ? collection : collection.map ? collection.map((definition) => [definition.symbol, definition]) : Object.entries(collection);
+    for (const [symbol, definition] of entries) {
+      if (merged.has(symbol)) {
+        const previous = merged.get(symbol);
+        if (JSON.stringify(previous) !== JSON.stringify(definition)) {
+          throw new Error(`Conflicting definitions for custom operator ':<${symbol}>:'`);
+        }
+        continue;
+      }
+      merged.set(symbol, definition);
+    }
+  }
+  return merged;
+}
+
 // ../../rix/src/parser/parser.js
 var PRECEDENCE = {
   STATEMENT: 0,
@@ -1070,6 +1348,7 @@ var PRECEDENCE = {
   EXPONENTIATION: 100,
   UNARY: 99,
   CALCULUS: 115,
+  CHECK: 9,
   POSTFIX: 120,
   PROPERTY: 130
 };
@@ -1077,11 +1356,6 @@ var JUXTAPOSITION_PRECEDENCE = 95;
 var IMPLICIT_APPLICATION_PRECEDENCE = 97;
 var SYMBOL_TABLE = {
   ":=": {
-    precedence: PRECEDENCE.ASSIGNMENT,
-    associativity: "right",
-    type: "infix"
-  },
-  ":=:": {
     precedence: PRECEDENCE.ASSIGNMENT,
     associativity: "right",
     type: "infix"
@@ -1470,13 +1744,16 @@ var SYMBOL_TABLE = {
 };
 
 class Parser {
-  constructor(tokens, systemLookup, source = "") {
+  constructor(tokens, systemLookup, source = "", customOperators = new Map) {
     this.tokens = tokens;
     this.systemLookup = systemLookup || (() => ({ type: "identifier" }));
     this.source = source;
+    this.customOperators = customOperators;
     this.position = 0;
     this.current = null;
     this.skippedComments = [];
+    this.stopExpressionAtOffset = null;
+    this.disablePostfixCheckParsing = false;
     this.advance();
   }
   advance() {
@@ -1528,9 +1805,23 @@ class Parser {
     throw new Error(`Parse error at position ${pos[0]}: ${message}`);
   }
   getSymbolInfo(token) {
-    if (token.type === "Symbol") {
+    if (token.type === "CustomOperator") {
+      const definition = this.customOperators.get(token.value);
+      if (!definition) {
+        this.error(`Custom operator ':<${token.value}>:' is not declared in an ##OPS## header`);
+      }
+      return {
+        precedence: definition.precedence,
+        associativity: definition.associativity,
+        type: definition.fixity,
+        custom: definition
+      };
+    } else if (token.type === "Symbol") {
       if (token.value === "|^:") {
         this.error("The legacy '|^:' generator operator was removed; use '|^' for lazy generation");
+      }
+      if (token.value === ":=:") {
+        this.error("The ':=:' solve operator was removed; express symbolic constraints with {# ... } and solve them with a plugin");
       }
       return SYMBOL_TABLE[token.value] || { precedence: 0, type: "unknown" };
     } else if (token.type === "SemicolonSequence") {
@@ -1734,6 +2025,9 @@ class Parser {
         } else if (token.value === "{") {
           return this.parseBraceContainer();
         } else if (token.value === "{=" || token.value === "{?" || token.value === "{;" || token.value === "{|" || token.value === "{:" || token.value === "{@" || token.value === "{#" || token.value === "{.." || token.value === "{>" || token.value === "{^" || token.value === "{$") {
+          if (token.value === "{$") {
+            this.error("The '{$ ... }' sigil is reserved for future async/concurrency syntax");
+          }
           if (token.value === "{#") {
             return this.parseSystemSpecLiteral();
           }
@@ -1775,6 +2069,8 @@ class Parser {
             let inner;
             if (nextVal === "{") {
               inner = this.parseBraceContainer();
+            } else if (nextVal === "{$") {
+              this.error("The '{$ ... }' sigil is reserved for future async/concurrency syntax");
             } else if (nextVal === "{#") {
               inner = this.parseSystemSpecLiteral();
             } else if (nextVal === "{^") {
@@ -1912,6 +2208,9 @@ class Parser {
           this.error(`Unexpected token in prefix position: ${token.value}`);
         }
         break;
+      case "CustomOperator":
+        this.error(`Custom infix operator ':<${token.value}>:' cannot appear in prefix position`);
+        break;
       default:
         this.error(`Unexpected token: ${token.type}`);
     }
@@ -2025,11 +2324,24 @@ class Parser {
     }
     this.advance();
     let rightPrec = symbolInfo.precedence;
-    if (symbolInfo.associativity === "left") {
+    if (symbolInfo.associativity === "left" || symbolInfo.associativity === "none") {
       rightPrec += 1;
     }
     let right;
-    if (operator.value === "[" && symbolInfo.type === "postfix") {
+    if (operator.type === "CustomOperator") {
+      right = this.parseExpression(rightPrec);
+      return this.createNode("CustomOperator", {
+        operator: operator.value,
+        spelling: `:<${operator.value}>:`,
+        definition: symbolInfo.custom,
+        precedence: symbolInfo.precedence,
+        associativity: symbolInfo.associativity,
+        left,
+        right,
+        pos: left.pos,
+        original: left.original + operator.original
+      });
+    } else if (operator.value === "[" && symbolInfo.type === "postfix") {
       if (this.current.value === ":" && ["Identifier", "Number", "String"].includes(this.peek().type)) {
         this.advance();
         const keyName = this.current.value;
@@ -2541,8 +2853,25 @@ class Parser {
   }
   parseExpressionRec(left, minPrec, stopAtGenerators = false) {
     while (this.current.type !== "End") {
+      if (this.stopExpressionAtOffset !== null && this.current.pos?.[0] >= this.stopExpressionAtOffset) {
+        break;
+      }
       if (this.current.value === ";" || this.current.value === "," || this.current.value === ")" || this.current.value === "]" || this.current.value === "}" || this.current.type === "SemicolonSequence") {
         break;
+      }
+      if (!this.disablePostfixCheckParsing && (this.current.value === "##@" || this.current.value === "##:" || this.current.value === "##!")) {
+        if (PRECEDENCE.CHECK < minPrec)
+          break;
+        if (this.current.value === "##@") {
+          left = this.parsePostfixPredicateCheck(left);
+        } else if (this.current.value === "##:") {
+          left = this.parsePostfixTypeCheck(left);
+        } else {
+          left = this.parsePostfixDiagnosticTap(left);
+        }
+        if (left.endsLineAt !== null && this.current.pos?.[0] >= left.endsLineAt)
+          break;
+        continue;
       }
       if (this.current.value === "(") {
         this.validateKnownSystemCallable(left);
@@ -2628,6 +2957,9 @@ class Parser {
       if (!symbolInfo || symbolInfo.precedence < minPrec) {
         break;
       }
+      if (symbolInfo.custom && left?.type === "CustomOperator" && left.precedence === symbolInfo.precedence && (left.associativity === "none" || symbolInfo.associativity === "none")) {
+        this.error(`Non-associative custom operator chain requires parentheses around ':<${left.operator}>:' or ':<${this.current.value}>:'`);
+      }
       if (symbolInfo.type === "statement" || symbolInfo.type === "separator") {
         break;
       }
@@ -2637,6 +2969,112 @@ class Parser {
       left = this.parseInfix(left, symbolInfo);
     }
     return left;
+  }
+  parsePostfixPredicateCheck(expression) {
+    const marker = this.current;
+    const lineEndAt = this.source.indexOf(`
+`, marker.pos[2]);
+    const previousStop = this.stopExpressionAtOffset;
+    const previousDisable = this.disablePostfixCheckParsing;
+    this.stopExpressionAtOffset = lineEndAt === -1 ? previousStop : lineEndAt;
+    this.disablePostfixCheckParsing = true;
+    this.advance();
+    const operator = this.current;
+    const symbolInfo = this.getSymbolInfo(operator);
+    if (!symbolInfo || symbolInfo.type !== "infix" || symbolInfo.precedence <= PRECEDENCE.ASSIGNMENT) {
+      this.stopExpressionAtOffset = previousStop;
+      this.disablePostfixCheckParsing = previousDisable;
+      this.error("Expected an infix predicate operator after ##@ (for example ==, >, or |>)");
+    }
+    const checkValue = this.createNode("PostfixCheckValue", {
+      pos: marker.pos,
+      original: "<checked value>"
+    });
+    try {
+      const predicate = this.parseInfix(checkValue, symbolInfo);
+      return this.createNode("PostfixPredicateCheck", {
+        expression,
+        predicate,
+        endsLineAt: lineEndAt === -1 ? null : lineEndAt,
+        pos: [expression.pos[0], expression.pos[1], predicate.pos[2]],
+        original: expression.original + marker.original + operator.original + (predicate.right?.original || "")
+      });
+    } finally {
+      this.stopExpressionAtOffset = previousStop;
+      this.disablePostfixCheckParsing = previousDisable;
+    }
+  }
+  parsePostfixTypeCheck(expression) {
+    const marker = this.current;
+    const lineEndAt = this.source.indexOf(`
+`, marker.pos[2]);
+    this.advance();
+    let name = null;
+    let semantic = false;
+    if (this.current.value === ":") {
+      semantic = true;
+      this.advance();
+    }
+    if (this.current.type !== "Identifier") {
+      this.error("Expected a kind or semantic name after ##:");
+    }
+    name = this.current.value;
+    const nameOriginal = this.current.original;
+    this.advance();
+    let shape = null;
+    if (this.current.value === "[") {
+      this.advance();
+      let source = "";
+      while (this.current.value !== "]" && this.current.type !== "End") {
+        source += this.current.original;
+        this.advance();
+      }
+      if (this.current.value !== "]")
+        this.error("Expected closing ] in ##: shape check");
+      this.advance();
+      if (!/^\d+(?:x\d+)*$/i.test(source)) {
+        this.error("Shape checks use positive dimensions such as [3] or [2x2]");
+      }
+      shape = source.toLowerCase().split("x").map((part) => Number(part));
+    }
+    return this.createNode("PostfixTypeCheck", {
+      expression,
+      spec: { name, semantic, shape },
+      endsLineAt: lineEndAt === -1 ? null : lineEndAt,
+      pos: [expression.pos[0], expression.pos[1], this.current.pos[0]],
+      original: expression.original + marker.original + (semantic ? ":" : "") + nameOriginal
+    });
+  }
+  parsePostfixDiagnosticTap(expression) {
+    const marker = this.current;
+    const lineEndAt = this.source.indexOf(`
+`, marker.pos[2]);
+    this.advance();
+    if (this.current.type !== "Identifier") {
+      this.error("Expected Debug, Trace, Info, Dump, or Log after ##!");
+    }
+    const action = this.current.value;
+    const actionOriginal = this.current.original;
+    if (!new Set(["debug", "trace", "info", "dump", "log"]).has(action.toLowerCase())) {
+      this.error("##! supports Debug, Trace, Info, Dump, or Log");
+    }
+    this.advance();
+    if (this.current.value !== "(")
+      this.error("Expected ( after ##! diagnostic action");
+    this.advance();
+    const arguments_ = this.parseFunctionCallArgs();
+    if (this.current.value !== ")")
+      this.error("Expected closing ) in ##! diagnostic tap");
+    const end = this.current.pos[2];
+    this.advance();
+    return this.createNode("PostfixDiagnosticTap", {
+      expression,
+      action,
+      arguments: arguments_,
+      endsLineAt: lineEndAt === -1 ? null : lineEndAt,
+      pos: [expression.pos[0], expression.pos[1], end],
+      original: expression.original + marker.original + actionOriginal + "(...)"
+    });
   }
   isGeneratorOperator(value) {
     return ["|+", "|*", "|:", "|?", "|^", "|;", "|>"].includes(value);
@@ -3392,6 +3830,9 @@ class Parser {
   }
   parseBraceSigil(sigil, containerName = null, options = {}) {
     const startToken = this.current;
+    if (sigil === "{$") {
+      this.error("The '{$ ... }' sigil is reserved for future async/concurrency syntax");
+    }
     this.advance();
     const isTensorShapeSigil = sigil === "{:" && containerName && /^\d+(?:x\d+)*$/.test(containerName);
     if (isTensorShapeSigil && !options.destructureAlias) {
@@ -3406,12 +3847,11 @@ class Parser {
       "{|": "SetContainer",
       "{:": "TupleContainer",
       "{@": "LoopContainer",
-      "{$": "BlockContainer",
       "{^": "ValueOutfit",
       "{>": "MultifunctionContainer"
     };
     const nodeType = sigilTypeMap[effectiveSigil];
-    const temporalSigils = new Set(["{?", "{;", "{@", "{$"]);
+    const temporalSigils = new Set(["{?", "{;", "{@"]);
     const isTemporal = temporalSigils.has(effectiveSigil);
     const closerMap = {
       "{|": ["|}", "}"]
@@ -3437,7 +3877,7 @@ class Parser {
       elements.push(this.createNode("Hole", { original: "" }));
     };
     const header = effectiveSigil === "{=" || effectiveSigil === "{|" || effectiveSigil === "{:" || effectiveSigil === "{.." ? this.parseSemanticHeader() : null;
-    const imports = (effectiveSigil === "{;" || effectiveSigil === "{@" || effectiveSigil === "{$") && this.startsImportHeader() ? this.parseImportHeader() : [];
+    const imports = (effectiveSigil === "{;" || effectiveSigil === "{@") && this.startsImportHeader() ? this.parseImportHeader() : [];
     const elements = [];
     const parseElement = effectiveSigil === "{=" ? () => this.parseMapConstructorEntry() : effectiveSigil === "{|" || effectiveSigil === "{:" || effectiveSigil === "{.." ? () => this.parseCapturedConstructorElement() : isTemporal ? () => this.parseCommaSequenceExpression(0) : () => this.parseExpression(0);
     if (!isCloser(this.current.value)) {
@@ -3541,8 +3981,7 @@ class Parser {
       });
     }
     const imports = this.startsImportHeader() ? this.parseImportHeader() : [];
-    const statements = [];
-    let expressionBody = null;
+    const bodyItems = [];
     if (this.current.value !== "}") {
       do {
         if (this.current.value === ";") {
@@ -3550,17 +3989,7 @@ class Parser {
           continue;
         }
         const expression = this.parseExpression(0);
-        if (expression?.type === "BinaryOperation" && expression.operator === "=") {
-          if (expressionBody) {
-            this.error("A symbolic expression body cannot be mixed with assignments");
-          }
-          statements.push(this.parseSystemSpecStatement(expression));
-        } else {
-          if (statements.length > 0 || expressionBody) {
-            this.error("A symbolic expression spec must contain exactly one expression");
-          }
-          expressionBody = expression;
-        }
+        bodyItems.push(expression?.type === "BinaryOperation" && expression.operator === "=" ? this.parseSystemSpecDefinition(expression) : expression);
         if (this.current.value === ";") {
           this.advance();
           if (this.current.value === "}")
@@ -3582,6 +4011,13 @@ class Parser {
       this.error("Expected closing } for system spec literal");
     }
     this.advance();
+    const soleItem = bodyItems.length === 1 ? bodyItems[0] : null;
+    const expressionBody = soleItem && soleItem.type !== "SpecDefinition" && !this.isSystemConstraintExpression(soleItem) ? soleItem : null;
+    const statements = expressionBody ? [] : bodyItems.map((item) => item.type === "SpecDefinition" ? item : this.createNode("SpecConstraint", {
+      expr: item,
+      pos: item.pos,
+      original: item.original
+    }));
     if (expressionBody && header.outputsDeclared) {
       this.error("An anonymous symbolic expression cannot declare named outputs");
     }
@@ -3592,7 +4028,7 @@ class Parser {
       inputs: header.inputs,
       outputs: finalized.outputs,
       outputsDeclared: header.outputsDeclared,
-      outputMode: expressionBody ? "expression" : "named",
+      outputMode: expressionBody ? "expression" : finalized.statements.some((statement) => statement.type === "SpecConstraint") ? "system" : "named",
       ...expressionBody ? { expression: expressionBody } : {},
       statements: finalized.statements,
       pos: startToken.pos,
@@ -3618,15 +4054,22 @@ class Parser {
       }
     }
   }
-  parseSystemSpecStatement(expression) {
+  isSystemConstraintExpression(expression) {
+    const unwrapped = expression?.type === "Grouping" && expression.expression ? expression.expression : expression;
+    if (unwrapped?.type === "BinaryOperation") {
+      return new Set(["==", "!=", "<", ">", "<=", ">=", "===", "?", "!?", "?&", "AND", "&&", "OR", "||"]).has(unwrapped.operator);
+    }
+    return unwrapped?.type === "UnaryOperation" && ["NOT", "!"].includes(unwrapped.operator);
+  }
+  parseSystemSpecDefinition(expression) {
     if (!expression || expression.type !== "BinaryOperation" || expression.operator !== "=") {
-      this.error("System spec bodies only support symbolic assignments of the form name = expr");
+      this.error("System spec definitions must have the form name = expr");
     }
     const target = expression.left;
     if (target.type !== "UserIdentifier" && target.type !== "SystemIdentifier") {
-      this.error("System spec assignment targets must be bare identifiers");
+      this.error("System spec definition targets must be bare identifiers");
     }
-    return this.createNode("SpecAssign", {
+    return this.createNode("SpecDefinition", {
       target: target.name,
       expr: expression.right,
       pos: expression.pos ?? target.pos,
@@ -3634,27 +4077,18 @@ class Parser {
     });
   }
   finalizeSystemSpecStatements(header, statements) {
-    const assigned = new Set;
+    const defined = new Set;
     const inferredOutputs = [];
-    const declaredOutputs = new Set(header.outputs);
     for (const statement of statements) {
+      if (statement.type !== "SpecDefinition")
+        continue;
       const target = statement.target;
-      if (assigned.has(target)) {
-        this.error(`System spec output '${target}' is assigned more than once`);
+      if (defined.has(target)) {
+        this.error(`System spec symbol '${target}' is defined more than once`);
       }
-      if (header.outputsDeclared && !declaredOutputs.has(target)) {
-        this.error(`System spec assignment target '${target}' is not a declared output`);
-      }
-      assigned.add(target);
+      defined.add(target);
       if (!header.outputsDeclared) {
         inferredOutputs.push(target);
-      }
-    }
-    if (header.outputsDeclared) {
-      for (const output of header.outputs) {
-        if (!assigned.has(output)) {
-          this.error(`System spec declared output '${output}' is never assigned`);
-        }
       }
     }
     return {
@@ -5029,7 +5463,7 @@ class Parser {
     });
   }
 }
-function parse(input, systemLookup) {
+function parse(input, systemLookup, options = {}) {
   let tokens;
   let source = "";
   if (typeof input === "string") {
@@ -5037,429 +5471,17 @@ function parse(input, systemLookup) {
     tokens = tokenize(input);
   } else {
     tokens = input;
+    source = options.source || "";
   }
-  const parser = new Parser(tokens, systemLookup, source);
+  const localOperators = extractOperatorDeclarations(tokens, {
+    source,
+    owner: options.operatorOwner || null,
+    label: options.file || "source"
+  });
+  const customOperators = mergeOperatorDefinitions(options.operatorDefinitions, localOperators);
+  const parser = new Parser(tokens, systemLookup, source, customOperators);
   return parser.parse();
 }
-// ../../rix/src/parser/system-loader.js
-var DEFAULT_SYSTEM_REGISTRY = {
-  LIST: { type: "constructor", category: "collection" },
-  SET: { type: "constructor", category: "collection" },
-  MAP: { type: "constructor", category: "collection" },
-  TUPLE: { type: "constructor", category: "collection" },
-  TYPE: { type: "function", arity: 1, precedence: 120, category: "meta" },
-  HELP: { type: "function", arity: -1, precedence: 120, category: "meta" },
-  INFO: { type: "function", arity: 1, precedence: 120, category: "meta" }
-};
-var isBrowser = typeof window !== "undefined" && typeof document !== "undefined";
-
-class SystemLoader {
-  constructor(options = {}) {
-    this.coreRegistry = new Map(Object.entries(DEFAULT_SYSTEM_REGISTRY));
-    this.systemRegistry = new Map;
-    this.operatorRegistry = new Map;
-    this.keywordRegistry = new Map;
-    this.hooks = new Map;
-    this.contexts = new Map;
-    this.config = {
-      allowUserOverrides: options.allowUserOverrides ?? false,
-      strictMode: options.strictMode ?? false,
-      browserIntegration: options.browserIntegration ?? isBrowser,
-      moduleLoader: options.moduleLoader ?? null,
-      ...options
-    };
-    this.initializeDefaultKeywords();
-    if (this.config.browserIntegration) {
-      this.setupBrowserIntegration();
-    }
-  }
-  initializeDefaultKeywords() {
-    this.registerKeyword("AND", {
-      type: "operator",
-      precedence: 40,
-      associativity: "left",
-      operatorType: "infix",
-      category: "logical"
-    });
-    this.registerKeyword("OR", {
-      type: "operator",
-      precedence: 30,
-      associativity: "left",
-      operatorType: "infix",
-      category: "logical"
-    });
-    this.registerKeyword("NOT", {
-      type: "operator",
-      precedence: 110,
-      operatorType: "prefix",
-      category: "logical"
-    });
-    this.registerKeyword("IF", {
-      type: "control",
-      structure: "conditional",
-      precedence: 5,
-      category: "control"
-    });
-    this.registerKeyword("ELSE", {
-      type: "control",
-      structure: "conditional",
-      precedence: 5,
-      category: "control"
-    });
-    this.registerKeyword("WHILE", {
-      type: "control",
-      structure: "loop",
-      precedence: 5,
-      category: "control"
-    });
-    this.registerKeyword("FOR", {
-      type: "control",
-      structure: "loop",
-      precedence: 5,
-      category: "control"
-    });
-    this.registerKeyword("IN", {
-      type: "operator",
-      precedence: 60,
-      associativity: "left",
-      operatorType: "infix",
-      category: "set"
-    });
-    this.registerKeyword("UNION", {
-      type: "operator",
-      precedence: 50,
-      associativity: "left",
-      operatorType: "infix",
-      category: "set"
-    });
-    this.registerKeyword("INTERSECT", {
-      type: "operator",
-      precedence: 50,
-      associativity: "left",
-      operatorType: "infix",
-      category: "set"
-    });
-  }
-  registerSystem(name, definition) {
-    if (!name || typeof name !== "string") {
-      throw new Error("System symbol name must be a non-empty string");
-    }
-    const normalizedName = name.toUpperCase();
-    const validatedDef = this.validateDefinition(definition);
-    if (this.config.strictMode && this.coreRegistry.has(normalizedName)) {
-      throw new Error(`Cannot override core system symbol: ${normalizedName}`);
-    }
-    this.systemRegistry.set(normalizedName, {
-      ...validatedDef,
-      source: "system",
-      registered: Date.now()
-    });
-    this.triggerHook("system-registered", {
-      name: normalizedName,
-      definition: validatedDef
-    });
-    return this;
-  }
-  registerKeyword(name, definition) {
-    const normalizedName = name.toUpperCase();
-    const validatedDef = this.validateDefinition(definition);
-    this.keywordRegistry.set(normalizedName, {
-      ...validatedDef,
-      source: "keyword",
-      registered: Date.now()
-    });
-    this.triggerHook("keyword-registered", {
-      name: normalizedName,
-      definition: validatedDef
-    });
-    return this;
-  }
-  registerOperator(symbol, definition) {
-    if (!symbol || typeof symbol !== "string") {
-      throw new Error("Operator symbol must be a non-empty string");
-    }
-    const validatedDef = this.validateOperatorDefinition(definition);
-    this.operatorRegistry.set(symbol, {
-      ...validatedDef,
-      source: "operator",
-      registered: Date.now()
-    });
-    this.triggerHook("operator-registered", {
-      symbol,
-      definition: validatedDef
-    });
-    return this;
-  }
-  lookup(name) {
-    const normalizedName = name.toUpperCase();
-    if (this.keywordRegistry.has(normalizedName)) {
-      const def = this.keywordRegistry.get(normalizedName);
-      if (def.type === "control") {
-        return this.enrichDefinition({
-          ...def,
-          functionalForm: true,
-          type: "function",
-          controlType: def.type,
-          arity: this.getControlArity(normalizedName, def)
-        }, normalizedName);
-      }
-      return this.enrichDefinition(def, normalizedName);
-    }
-    if (this.systemRegistry.has(normalizedName)) {
-      const def = this.systemRegistry.get(normalizedName);
-      return this.enrichDefinition(def, normalizedName);
-    }
-    if (this.coreRegistry.has(normalizedName)) {
-      const def = this.coreRegistry.get(normalizedName);
-      return this.enrichDefinition(def, normalizedName);
-    }
-    return { type: "identifier", name: normalizedName, source: "unknown" };
-  }
-  validateDefinition(definition) {
-    if (!definition || typeof definition !== "object") {
-      throw new Error("Definition must be an object");
-    }
-    const { type } = definition;
-    if (!type || typeof type !== "string") {
-      throw new Error("Definition must have a type property");
-    }
-    switch (type) {
-      case "operator":
-        if (!definition.precedence || typeof definition.precedence !== "number") {
-          throw new Error("Operator definition must have numeric precedence");
-        }
-        break;
-      case "function":
-        if (definition.arity !== undefined && typeof definition.arity !== "number") {
-          throw new Error("Function arity must be a number or undefined");
-        }
-        break;
-      case "control":
-        if (!definition.structure || typeof definition.structure !== "string") {
-          throw new Error("Control definition must have a structure property");
-        }
-        break;
-    }
-    return { ...definition };
-  }
-  validateOperatorDefinition(definition) {
-    const validated = this.validateDefinition(definition);
-    if (validated.type !== "operator") {
-      validated.type = "operator";
-    }
-    if (!validated.precedence) {
-      validated.precedence = 50;
-    }
-    if (!validated.associativity) {
-      validated.associativity = "left";
-    }
-    if (!validated.operatorType) {
-      validated.operatorType = "infix";
-    }
-    return validated;
-  }
-  enrichDefinition(definition, name) {
-    return {
-      ...definition,
-      name,
-      resolvedAt: Date.now()
-    };
-  }
-  registerHook(eventName, callback) {
-    if (!this.hooks.has(eventName)) {
-      this.hooks.set(eventName, []);
-    }
-    this.hooks.get(eventName).push(callback);
-    return this;
-  }
-  triggerHook(eventName, data) {
-    if (this.hooks.has(eventName)) {
-      this.hooks.get(eventName).forEach((callback) => {
-        try {
-          callback(data);
-        } catch (error) {
-          console.warn(`Hook ${eventName} failed:`, error);
-        }
-      });
-    }
-  }
-  setupBrowserIntegration() {
-    if (!isBrowser)
-      return;
-    if (typeof window.RiX === "undefined") {
-      window.RiX = {};
-    }
-    window.RiX.SystemLoader = this;
-    window.RiX.registerSystem = (name, def) => this.registerSystem(name, def);
-    window.RiX.registerKeyword = (name, def) => this.registerKeyword(name, def);
-    window.RiX.registerOperator = (symbol, def) => this.registerOperator(symbol, def);
-    if (!this.config.moduleLoader) {
-      this.config.moduleLoader = this.createBrowserModuleLoader();
-    }
-    document.addEventListener("rix-system-define", (event) => {
-      const { name, definition } = event.detail;
-      this.registerSystem(name, definition);
-    });
-    document.addEventListener("rix-keyword-define", (event) => {
-      const { name, definition } = event.detail;
-      this.registerKeyword(name, definition);
-    });
-  }
-  createBrowserModuleLoader() {
-    return {
-      async load(moduleSpec) {
-        if (moduleSpec.startsWith("http://") || moduleSpec.startsWith("https://")) {
-          const response = await fetch(moduleSpec);
-          const code = await response.text();
-          return this.evaluateModule(code);
-        } else if (moduleSpec.startsWith("data:")) {
-          const code = decodeURIComponent(moduleSpec.split(",")[1]);
-          return this.evaluateModule(code);
-        } else {
-          const scriptTag = document.getElementById(moduleSpec);
-          if (scriptTag && scriptTag.type === "text/rix-system") {
-            return this.evaluateModule(scriptTag.textContent);
-          }
-        }
-        throw new Error(`Cannot load module: ${moduleSpec}`);
-      },
-      evaluateModule(code) {
-        try {
-          const moduleFunction = new Function("SystemLoader", "registerSystem", "registerKeyword", "registerOperator", code);
-          return moduleFunction(this, (name, def) => this.registerSystem(name, def), (name, def) => this.registerKeyword(name, def), (symbol, def) => this.registerOperator(symbol, def));
-        } catch (error) {
-          throw new Error(`Module evaluation failed: ${error.message}`);
-        }
-      }
-    };
-  }
-  async loadModule(moduleSpec) {
-    if (!this.config.moduleLoader) {
-      throw new Error("No module loader configured");
-    }
-    try {
-      const result = await this.config.moduleLoader.load(moduleSpec);
-      this.triggerHook("module-loaded", { moduleSpec, result });
-      return result;
-    } catch (error) {
-      this.triggerHook("module-load-error", { moduleSpec, error });
-      throw error;
-    }
-  }
-  createContext(name, parentContext = null) {
-    const context = {
-      name,
-      parent: parentContext,
-      created: Date.now(),
-      symbols: new Map,
-      operators: new Map
-    };
-    this.contexts.set(name, context);
-    return context;
-  }
-  getControlArity(name, definition) {
-    switch (definition.structure) {
-      case "conditional":
-        return name === "IF" ? -1 : 1;
-      case "loop":
-        return name === "FOR" ? 4 : 2;
-      case "loop_body":
-      case "loop_terminator":
-      case "block_end":
-        return 1;
-      default:
-        return -1;
-    }
-  }
-  transformFunctionalForm(name, args, definition) {
-    switch (name) {
-      case "WHILE":
-        if (args.length >= 2) {
-          return {
-            type: "ControlStructure",
-            keyword: "WHILE",
-            condition: args[0],
-            body: args[1],
-            structure: "while_loop",
-            functionalOrigin: true
-          };
-        }
-        break;
-      case "IF":
-        if (args.length >= 2) {
-          const result = {
-            type: "ControlStructure",
-            keyword: "IF",
-            condition: args[0],
-            thenBranch: args[1],
-            structure: "conditional",
-            functionalOrigin: true
-          };
-          if (args.length >= 3) {
-            result.elseBranch = args[2];
-          }
-          return result;
-        }
-        break;
-      case "FOR":
-        if (args.length >= 4) {
-          return {
-            type: "ControlStructure",
-            keyword: "FOR",
-            init: args[0],
-            condition: args[1],
-            increment: args[2],
-            body: args[3],
-            structure: "for_loop",
-            functionalOrigin: true
-          };
-        }
-        break;
-    }
-    return {
-      type: "FunctionCall",
-      function: { type: "SystemIdentifier", name, systemInfo: definition },
-      arguments: args,
-      functionalForm: true
-    };
-  }
-  getSymbolsByCategory(category) {
-    const result = [];
-    [this.coreRegistry, this.systemRegistry, this.keywordRegistry].forEach((registry) => {
-      for (const [name, definition] of registry) {
-        if (definition.category === category) {
-          result.push({ name, ...definition });
-        }
-      }
-    });
-    return result;
-  }
-  createParserLookup() {
-    return (name) => this.lookup(name);
-  }
-  exportConfig() {
-    return {
-      core: Array.from(this.coreRegistry.entries()),
-      system: Array.from(this.systemRegistry.entries()),
-      keywords: Array.from(this.keywordRegistry.entries()),
-      operators: Array.from(this.operatorRegistry.entries()),
-      config: { ...this.config }
-    };
-  }
-  importConfig(config) {
-    if (config.system) {
-      config.system.forEach(([name, def]) => this.systemRegistry.set(name, def));
-    }
-    if (config.keywords) {
-      config.keywords.forEach(([name, def]) => this.keywordRegistry.set(name, def));
-    }
-    if (config.operators) {
-      config.operators.forEach(([symbol, def]) => this.operatorRegistry.set(symbol, def));
-    }
-    this.triggerHook("config-imported", config);
-  }
-}
-var defaultSystemLoader = new SystemLoader;
 // ../../rix/src/runtime/system-context.js
 function firstLetterIsUppercase(name) {
   for (const character of String(name)) {
@@ -10622,7 +10644,7 @@ var runtimeDefaults = Object.freeze({
     permissions: Object.freeze(["IMPORTS"])
   }),
   capabilityGroups: Object.freeze({
-    Output: Object.freeze(["BIND", "LIVEVIEW", "TEXT", "PARAGRAPH", "HEADING", "FRAGMENT", "TABLE", "GRID", "SHEET", "CONTROLPANEL", "FIGURE", "SLIDE", "SLIDES", "Algebra"]),
+    Output: Object.freeze(["OUT", "BIND", "LIVEVIEW", "TEXT", "PARAGRAPH", "HEADING", "FRAGMENT", "SNAPSHOTS", "TABLE", "GRID", "SHEET", "CONTROLPANEL", "FIGURE", "SLIDE", "SLIDES", "Algebra", "Timeline"]),
     Controls: Object.freeze(["CONTROLPANEL", "Controls"]),
     Graphics: Object.freeze(["Graphics"]),
     Draw: Object.freeze(["draw"]),
@@ -10640,7 +10662,7 @@ var runtimeDefaults = Object.freeze({
     Files: Object.freeze(["FILES"]),
     Units: Object.freeze(["UNITS", "Units", "CONVERTUNIT", "ConvertUnit", "DEFINEUNIT", "DefineUnit"]),
     Exact: Object.freeze(["EXACT", "Exact", "COMPLEX", "Complex", "DEFINEEXACTGENERATOR", "DefineExactGenerator", "exactalgebras"]),
-    Symbolic: Object.freeze(["POLY", "DERIV", "INTEGRATE", "TRANSFORM", "SIMPLIFY", "SPEC", "SPECCABILITY", "INSPECTSPEC", "SArith"]),
+    Symbolic: Object.freeze(["POLY", "DERIV", "INTEGRATE", "TRANSFORM", "SIMPLIFY", "SPEC", "SPECCABILITY", "INSPECTSPEC", "SPECROLES", "SArith"]),
     Notation: Object.freeze(["SArith", "Poly", "NotationParser"]),
     Random: Object.freeze(["RANDOMSEED", "RandomSeed", "RAND_NAME"]),
     RiXCel: Object.freeze(["FORMULASHEET", "REACTIVEGRAPH", "RIXCELEXPORT", "RIXCELIMPORT", "RIXCELIMPORTCSV", "RIXCELIMPORTTSV", "RIXCELEXPORTCSV", "RIXCELEXPORTTSV"])
@@ -10963,6 +10985,21 @@ var BINARY_TEXT = new Map([
   ["INTDIV", "//"],
   ["MOD", "%"]
 ]);
+var DISPLAY_BINARY_TEXT = new Map([
+  ...BINARY_TEXT,
+  ["EQ", "=="],
+  ["NEQ", "!="],
+  ["SAME_CELL", "==="],
+  ["LT", "<"],
+  ["GT", ">"],
+  ["LTE", "<="],
+  ["GTE", ">="],
+  ["AND", "AND"],
+  ["OR", "OR"],
+  ["MEMBER", "?"],
+  ["NOT_MEMBER", "!?"],
+  ["INTERSECTS", "?&"]
+]);
 var TEXT_BINARY = new Map(Array.from(BINARY_TEXT, ([name, text]) => [text, name]));
 var ir = (fn, ...args) => ({ fn, args });
 var literal = (value) => ir("LITERAL", String(value));
@@ -11005,7 +11042,7 @@ function expressionOf(spec) {
     throw new Error("Expected a symbolic specification");
   if (spec.expression)
     return spec.expression;
-  if (spec.outputs.length !== 1 || spec.statements.length !== 1) {
+  if (spec.outputs.length !== 1 || spec.statements.length !== 1 || spec.statements[0].kind !== "define") {
     throw new Error("Symbolic operations currently require a single explicitly solved output");
   }
   return spec.statements[0].expr;
@@ -11019,8 +11056,8 @@ function createSymbolicSpec(meta, context = null) {
   let outputs = [...meta.outputs || []];
   let expression = meta.expression ? cloneIr(meta.expression) : null;
   let statements = (meta.statements || []).map((statement) => ({
-    kind: "assign",
-    target: statement.target,
+    kind: statement.kind === "constraint" ? "constraint" : "define",
+    ...statement.target ? { target: statement.target } : {},
     expr: cloneIr(statement.expr)
   }));
   if (outputMode === "identity") {
@@ -11070,11 +11107,17 @@ function specWithExpression(source, expression, options = {}) {
 function precedence(node) {
   if (!node?.fn)
     return 100;
+  if (node.fn === "OR")
+    return 2;
+  if (node.fn === "AND")
+    return 3;
+  if (["EQ", "NEQ", "SAME_CELL", "LT", "GT", "LTE", "GTE", "MEMBER", "NOT_MEMBER", "INTERSECTS"].includes(node.fn))
+    return 5;
   if (node.fn === "ADD" || node.fn === "SUB")
     return 10;
   if (node.fn === "MUL" || node.fn === "DIV" || node.fn === "INTDIV" || node.fn === "MOD")
     return 20;
-  if (node.fn === "NEG")
+  if (node.fn === "NEG" || node.fn === "NOT")
     return 30;
   if (node.fn === "POW")
     return 40;
@@ -11099,6 +11142,10 @@ function renderSymbolicIr(node, parentPrecedence = 0, side = null) {
     const text = `-${renderSymbolicIr(node.args[0], precedence(node))}`;
     return precedence(node) < parentPrecedence ? `(${text})` : text;
   }
+  if (node.fn === "NOT") {
+    const text = `NOT ${renderSymbolicIr(node.args[0], precedence(node))}`;
+    return precedence(node) < parentPrecedence ? `(${text})` : text;
+  }
   if (node.fn === "CALL") {
     return `${node.args[0]}(${node.args.slice(1).map((arg) => renderSymbolicIr(arg)).join(", ")})`;
   }
@@ -11108,7 +11155,24 @@ function renderSymbolicIr(node, parentPrecedence = 0, side = null) {
   if (node.fn === "SYS_CALL") {
     return `.${node.args[0]}(${node.args.slice(1).map((arg) => renderSymbolicIr(arg)).join(", ")})`;
   }
-  const op = BINARY_TEXT.get(node.fn);
+  if (node.fn === "ABS")
+    return `|${renderSymbolicIr(node.args[0])}|`;
+  if (node.fn === "INTERVAL")
+    return node.args.map((arg) => renderSymbolicIr(arg)).join(":");
+  if (node.fn === "ARRAY")
+    return `[${node.args.map((arg) => renderSymbolicIr(arg)).join(", ")}]`;
+  if (node.fn === "TUPLE")
+    return `{: ${node.args.map((arg) => renderSymbolicIr(arg)).join(", ")} }`;
+  if (node.fn === "SET")
+    return `{| ${node.args.map((arg) => renderSymbolicIr(arg)).join(", ")} |}`;
+  if (node.fn === "META_GET")
+    return `${renderSymbolicIr(node.args[0], 100)}.${node.args[1]}`;
+  if (node.fn === "INDEX_GET") {
+    const target = renderSymbolicIr(node.args[0], 100);
+    const index = typeof node.args[1] === "string" ? node.args[1] : renderSymbolicIr(node.args[1]);
+    return `${target}[${index}]`;
+  }
+  const op = DISPLAY_BINARY_TEXT.get(node.fn);
   if (op) {
     const own = precedence(node);
     const left = renderSymbolicIr(node.args[0], own, "left");
@@ -11118,7 +11182,8 @@ function renderSymbolicIr(node, parentPrecedence = 0, side = null) {
     const parens = own < parentPrecedence || side === "left" && node.fn === "POW" && own === parentPrecedence;
     return parens ? `(${text})` : text;
   }
-  throw new Error(`Cannot render unsupported symbolic IR '${node.fn}'`);
+  const genericArgs = (node.args || []).map((arg) => arg?.fn ? renderSymbolicIr(arg) : typeof arg === "string" ? JSON.stringify(arg) : JSON.stringify(arg)).join(", ");
+  return `@_${node.fn}(${genericArgs})`;
 }
 function formatSymbolicSpec(spec) {
   const inputs = spec.inputs.join(",");
@@ -11129,9 +11194,10 @@ function formatSymbolicSpec(spec) {
       return item.local;
     return `${item.local}${item.mode === "alias" ? "=" : "~"}${item.source}`;
   }).join(",")}> ` : "";
-  if (outputModeOf(spec) === "named") {
+  if (outputModeOf(spec) === "named" || outputModeOf(spec) === "system") {
     const header2 = spec.outputsDeclared ? `${inputs}:${spec.outputs.join(",")}# ` : inputs ? `${inputs}# ` : " ";
-    return `{#${header2}${imports}${spec.statements.map((s) => `${s.target} = ${renderSymbolicIr(s.expr)}`).join("; ")} }`;
+    const body = spec.statements.map((statement) => statement.kind === "constraint" ? renderSymbolicIr(statement.expr) : `${statement.target} = ${renderSymbolicIr(statement.expr)}`).join("; ");
+    return `{#${header2}${imports}${body}${body ? " " : ""}}`;
   }
   const header = inputs ? `${inputs}# ` : " ";
   return `{#${header}${imports}${renderSymbolicIr(expressionOf(spec))} }`;
@@ -11147,13 +11213,18 @@ function serializeIr(node) {
     return rixMap([["kind", rixString2("outer")], ["name", rixString2(node.args[0])]]);
   if (node.fn === "NEG")
     return rixMap([["kind", rixString2("unary")], ["op", rixString2("-")], ["expr", serializeIr(node.args[0])]]);
-  const op = BINARY_TEXT.get(node.fn);
+  if (node.fn === "NOT")
+    return rixMap([["kind", rixString2("unary")], ["op", rixString2("NOT")], ["expr", serializeIr(node.args[0])]]);
+  const op = DISPLAY_BINARY_TEXT.get(node.fn);
   if (op)
     return rixMap([["kind", rixString2("binary")], ["op", rixString2(op)], ["left", serializeIr(node.args[0])], ["right", serializeIr(node.args[1])]]);
   return rixMap([["kind", rixString2("ir")], ["fn", rixString2(node.fn)], ["args", rixTuple(node.args.map(serializeIr))]]);
 }
 function inspectSymbolicSpec(spec) {
-  const inspectExpression = spec.expression ? serializeIr(spec.expression) : spec.statements.length === 1 ? serializeIr(spec.statements[0].expr) : null;
+  const inspectExpression = spec.expression ? serializeIr(spec.expression) : spec.statements.length === 1 && spec.statements[0].kind === "define" ? serializeIr(spec.statements[0].expr) : null;
+  const symbols2 = symbolicNames(spec);
+  const definitions = spec.statements.filter((statement) => statement.kind === "define");
+  const constraints = spec.statements.filter((statement) => statement.kind === "constraint");
   return rixMap([
     ["kind", rixString2("systemSpec")],
     ["syntax", rixString2("#")],
@@ -11161,9 +11232,15 @@ function inspectSymbolicSpec(spec) {
     ["source", rixString2(formatSymbolicSpec(spec))],
     ["inputs", rixTuple(spec.inputs.map(rixString2))],
     ["outputs", rixTuple(spec.outputs.map(rixString2))],
-    ["statements", rixTuple(spec.statements.map((statement) => rixMap([
-      ["kind", rixString2("assign")],
+    ["symbols", rixTuple(symbols2.map(rixString2))],
+    ["definitions", rixTuple(definitions.map((statement) => rixMap([
       ["target", rixString2(statement.target)],
+      ["expr", serializeIr(statement.expr)]
+    ])))],
+    ["constraints", rixTuple(constraints.map((statement) => serializeIr(statement.expr)))],
+    ["statements", rixTuple(spec.statements.map((statement) => rixMap([
+      ["kind", rixString2(statement.kind)],
+      ...statement.target ? [["target", rixString2(statement.target)]] : [],
       ["expr", serializeIr(statement.expr)]
     ])))],
     ["expression", inspectExpression]
@@ -11467,6 +11544,82 @@ function retrieveNames(node, names = new Set) {
       retrieveNames(arg, names);
   return names;
 }
+function symbolicNames(value) {
+  const spec = getAttachedSpec(value);
+  if (!isSymbolicSpec(spec))
+    throw new Error("Expected a symbolic specification");
+  const names = unionNames([spec.inputs, spec.outputs]);
+  const add = (name) => {
+    if (!names.includes(name))
+      names.push(name);
+  };
+  for (const statement of spec.statements || []) {
+    if (statement.kind === "define" && statement.target)
+      add(statement.target);
+    for (const name of retrieveNames(statement.expr))
+      add(name);
+  }
+  if (spec.expression)
+    for (const name of retrieveNames(spec.expression))
+      add(name);
+  return names;
+}
+function roleEntries(overrides) {
+  if (overrides === null || overrides === undefined)
+    return null;
+  if (overrides?.type === "map" && overrides.entries instanceof Map)
+    return overrides.entries;
+  if (overrides instanceof Map)
+    return overrides;
+  if (typeof overrides === "object" && !Array.isArray(overrides))
+    return new Map(Object.entries(overrides));
+  throw new Error("Symbolic role overrides must be a map with inputs and/or outputs");
+}
+function roleName(value) {
+  const name = value?.value ?? value;
+  if (typeof name !== "string" || !name.length)
+    throw new Error("Symbolic role names must be strings or colon-strings");
+  return name;
+}
+function roleList(value, label) {
+  if (value === null || value === undefined)
+    return [];
+  const values = Array.isArray(value) ? value : ["tuple", "array", "sequence"].includes(value?.type) ? value.values : [value];
+  const result = values.map(roleName);
+  if (new Set(result).size !== result.length)
+    throw new Error(`Duplicate symbolic ${label} role`);
+  return result;
+}
+function resolveSymbolicRoles(value, overrides = null) {
+  const spec = getAttachedSpec(value);
+  if (!isSymbolicSpec(spec))
+    throw new Error("Expected a symbolic specification or spec-backed value");
+  const symbols2 = symbolicNames(spec);
+  const entries = roleEntries(overrides);
+  const inputs = entries?.has("inputs") ? roleList(entries.get("inputs"), "input") : [...spec.inputs];
+  const outputs = entries?.has("outputs") ? roleList(entries.get("outputs"), "output") : [...spec.outputs];
+  const known = new Set(symbols2);
+  for (const name of [...inputs, ...outputs]) {
+    if (!known.has(name))
+      throw new Error(`Symbolic role '${name}' is not present in the specification`);
+  }
+  const inputSet = new Set(inputs);
+  for (const name of outputs) {
+    if (inputSet.has(name))
+      throw new Error(`Symbolic role '${name}' cannot be both an input and an output`);
+  }
+  const assigned = new Set([...inputs, ...outputs]);
+  return { symbols: symbols2, inputs, outputs, unassigned: symbols2.filter((name) => !assigned.has(name)) };
+}
+function symbolicRolesValue(value, overrides = null) {
+  const roles = resolveSymbolicRoles(value, overrides);
+  return rixMap([
+    ["symbols", rixTuple(roles.symbols.map(rixString2))],
+    ["inputs", rixTuple(roles.inputs.map(rixString2))],
+    ["outputs", rixTuple(roles.outputs.map(rixString2))],
+    ["unassigned", rixTuple(roles.unassigned.map(rixString2))]
+  ]);
+}
 function unionScopes(groups, referencedNames = null) {
   const result = [];
   const seen = new Set;
@@ -11514,8 +11667,30 @@ function applySymbolicSpec(spec, args) {
     }
   }
   const remaining = spec.inputs.slice(args.length);
-  const expression = substituteIr(expressionOf(spec), substitutions);
   const inputs = unionNames([...argumentSpecs.map((item) => item.inputs), remaining]);
+  if (outputModeOf(spec) === "system") {
+    const statements = spec.statements.map((statement) => ({
+      ...statement,
+      expr: substituteIr(statement.expr, substitutions)
+    }));
+    const capturedNames2 = new Set;
+    for (const statement of statements)
+      retrieveNames(statement.expr, capturedNames2);
+    for (const input of inputs)
+      capturedNames2.delete(input);
+    return createSymbolicSpec({
+      inputs,
+      outputs: spec.outputs,
+      outputsDeclared: spec.outputsDeclared,
+      outputMode: "system",
+      statements,
+      imports: spec.imports,
+      __closureScopes: unionScopes([spec.__closureScopes, ...argumentSpecs.map((item) => item.__closureScopes)], capturedNames2),
+      origin: spec.origin,
+      transform: { operation: "substitute" }
+    });
+  }
+  const expression = substituteIr(expressionOf(spec), substitutions);
   const capturedNames = retrieveNames(expression);
   for (const input of inputs)
     capturedNames.delete(input);
@@ -11992,7 +12167,8 @@ var symbolicCapabilities = {
   SIMPLIFY: { impl: (args) => transformValue(args), pure: true, doc: "Compatibility alias for Transform" },
   SPEC: { impl: ([value]) => explicitSpec(value), doc: "Analyze a pure function and attach/return its symbolic spec" },
   SPECCABILITY: { impl: ([value]) => speccabilityValue(value), pure: true, doc: "Report whether a pure function can be represented by the exact symbolic subset" },
-  INSPECTSPEC: { impl: ([value]) => inspectSymbolicSpec(getAttachedSpec(value) || value), pure: true, doc: "Return the structural inspection map for a symbolic spec" }
+  INSPECTSPEC: { impl: ([value]) => inspectSymbolicSpec(getAttachedSpec(value) || value), pure: true, doc: "Return the structural inspection map for a symbolic spec" },
+  SPECROLES: { impl: ([value, overrides = null]) => symbolicRolesValue(value, overrides), pure: true, doc: "Resolve all symbols and input/output roles, with optional role overrides" }
 };
 var symbolicFunctions = {
   SYSTEM_SPEC: {
@@ -12051,6 +12227,7 @@ function graphMethods() {
     ["DERIVE", method("Derive", ([target, name, formula]) => target.addComputed(name, formula))],
     ["GET", method("Get", ([target, name]) => target.get(name))],
     ["NODE", method("Node", ([target, name]) => target.node(name))],
+    ["TOUCH", method("Touch", ([target, name]) => target.touch(name))],
     ["RECALCULATE", method("Recalculate", ([target]) => target.recalculate())],
     ["_mutable", new Integer(1n)]
   ]);
@@ -12061,6 +12238,7 @@ function nodeMethods() {
     ["PEEK", method("Peek", ([target]) => target.peek())],
     ["SET", method("Set", ([target, value]) => target.set(value))],
     ["REPLACEVALUE", method("ReplaceValue", ([target, value]) => target.replaceValue(value))],
+    ["TOUCH", method("Touch", ([target]) => target.touch())],
     ["GETFORMULA", method("GetFormula", ([target]) => target.formula)],
     ["SETFORMULA", method("SetFormula", ([target, formula]) => target.setFormula(formula))],
     ["LIVE", method("Live", ([target]) => target.live())],
@@ -12167,6 +12345,9 @@ function createReactiveGraph(options = {}) {
       replaceValue(value, metadata = null) {
         return graph.replaceValue(name, value, metadata);
       },
+      touch(metadata = null) {
+        return graph.touch(name, metadata);
+      },
       setFormula(formula, metadata = null) {
         if (kind !== "computed")
           throw new Error(`Reactive source node ${name} has no formula`);
@@ -12195,7 +12376,7 @@ function createReactiveGraph(options = {}) {
     };
     return node;
   }
-  function runEpoch({ dirty, sourceOverrides = new Map, cause = null, evaluateAll = false } = {}) {
+  function runEpoch({ dirty, sourceOverrides = new Map, cause = null, evaluateAll = false, forcePublish = new Set, preserveValues = new Set } = {}) {
     if (activeEpoch) {
       throw new Error(options.nestedEpochError || "Reactive computations cannot start a nested graph epoch");
     }
@@ -12206,11 +12387,11 @@ function createReactiveGraph(options = {}) {
       stagedValues.set(name, value);
     const states = new Map([...nodes].map(([name, node]) => [
       name,
-      requested.has(name) && node.kind === "computed" ? "dirty" : "clean"
+      requested.has(name) && node.kind === "computed" && !preserveValues.has(name) ? "dirty" : "clean"
     ]));
     const dependencies = new Map([...nodes].map(([name, node]) => [
       name,
-      requested.has(name) && node.kind === "computed" ? new Set : new Set(node.dependencies)
+      requested.has(name) && node.kind === "computed" && !preserveValues.has(name) ? new Set : new Set(node.dependencies)
     ]));
     const stack = [];
     let currentName = null;
@@ -12300,9 +12481,10 @@ function createReactiveGraph(options = {}) {
       previousEpoch,
       epoch: graph.epoch,
       changed: Object.freeze(changed),
+      touched: Object.freeze([...forcePublish]),
       cause
     });
-    for (const name of changed)
+    for (const name of new Set([...changed, ...forcePublish]))
       nodes.get(name)._publish(event);
     for (const listener of [...channel])
       listener(event);
@@ -12563,6 +12745,17 @@ function createReactiveGraph(options = {}) {
         source: metadata?.source ?? null
       });
       return value;
+    },
+    touch(name, metadata = null) {
+      name = canonicalName(name);
+      const node = requireNode(name);
+      runEpoch({
+        dirty: new Set([name]),
+        forcePublish: new Set([node.name]),
+        preserveValues: new Set([node.name]),
+        cause: { type: "reactive:touch", name: node.name, metadata }
+      });
+      return node.value;
     },
     setFormula(name, formula, metadata = null) {
       name = canonicalName(name);
@@ -15048,6 +15241,8 @@ function controlBehavior(entry, fields, name, runtime, allowed = Object.keys(fie
   return {
     display: controlDisplay(entry, fields, name, runtime, allowed),
     formatKeys: Object.freeze(formatKeys),
+    style: optionalMap(get(entry, "style"), `${name} style`),
+    metadata: optionalMap(get(entry, "metadata"), `${name} metadata`),
     disabled: has(entry, "disabled") && get(entry, "disabled") !== null,
     readOnly: has(entry, "readOnly") && get(entry, "readOnly") !== null,
     validation: validateCandidate?.(fields.value) ?? null,
@@ -15086,10 +15281,10 @@ var INLINE_OUTPUT_KINDS = new Set([
   "line_break"
 ]);
 function isInlineOutput(value) {
-  return isOutputValue(value) && INLINE_OUTPUT_KINDS.has(value.kind);
+  return isOutputValue(value) && (INLINE_OUTPUT_KINDS.has(value.kind) || value.kind === "image" && !value.caption);
 }
 function isBlockOutput(value) {
-  return isOutputValue(value) && !INLINE_OUTPUT_KINDS.has(value.kind) && value.kind !== "asset";
+  return isOutputValue(value) && (!INLINE_OUTPUT_KINDS.has(value.kind) || value.kind === "image");
 }
 function contentItems(value, label) {
   return isSequence(value) || Array.isArray(value) ? sequence(value, label) : [value];
@@ -15131,6 +15326,106 @@ function enabled(value) {
   if (value instanceof Rational)
     return value.numerator !== 0n;
   return Boolean(value);
+}
+function exactPositiveIndex(value, label) {
+  const index = exactInteger3(value, label);
+  if (!Number.isSafeInteger(index) || index < 1)
+    throw new Error(`${label} must be a positive safe integer`);
+  return index;
+}
+function sceneEntries(value, runtime, name) {
+  let ordinal = 0;
+  return sequence(value, `${name} entries`).flatMap((entry, group) => {
+    let scene;
+    let states;
+    let label = null;
+    if (entry?.type === "map") {
+      const fields = map(entry, `${name} entry ${group + 1}`);
+      if (!has(fields, "scene") || !has(fields, "states")) {
+        throw new Error(`${name} entry ${group + 1} requires scene and states`);
+      }
+      scene = get(fields, "scene");
+      states = get(fields, "states");
+      label = asString(get(fields, "label"));
+    } else {
+      const pair = sequence(entry, `${name} entry ${group + 1}`);
+      if (pair.length !== 2)
+        throw new Error(`${name} entry ${group + 1} must be a [scene, states] tuple`);
+      [scene, states] = pair;
+    }
+    return sequence(states, `${name} entry ${group + 1} states`).map((state, index) => {
+      const originEntries = new Map([
+        ["entry", int3(group + 1)],
+        ["state", int3(index + 1)],
+        ["ordinal", int3(ordinal + 1)]
+      ]);
+      if (label !== null)
+        originEntries.set("label", { type: "string", value: label });
+      const origin = Object.freeze({
+        type: "map",
+        entries: originEntries,
+        _ext: new Map([["immutable", int3(1)]])
+      });
+      const content = invokeControlCallable(scene, [state, origin], runtime, `${name} entry ${group + 1} scene`);
+      if (!isBlockOutput(content)) {
+        const actual = isOutputValue(content) ? content.kind : typeof content;
+        throw new Error(`${name} scene ${group + 1}.${index + 1} must return block output; received ${actual}`);
+      }
+      ordinal += 1;
+      return Object.freeze({
+        state,
+        origin,
+        content
+      });
+    });
+  });
+}
+function createSnapshots(args, runtime = null) {
+  const entry = spec(args, ["entries"], "Snapshots");
+  if (has(entry, "columns")) {
+    throw new Error("Snapshots no longer accepts columns; pass its ordered list to a grid renderer instead");
+  }
+  const snapshots = Object.freeze(sceneEntries(get(entry, "entries"), runtime, "Snapshots"));
+  if (snapshots.length === 0)
+    throw new Error("Snapshots requires at least one rendered scene");
+  return output("snapshots", {
+    snapshots,
+    title: asString(get(entry, "title")),
+    caption: asString(get(entry, "caption")),
+    style: optionalMap(get(entry, "style"), "Snapshots style")
+  });
+}
+function createTimelineSequence(args, runtime = null) {
+  const entry = spec(args, ["entries", "duration"], "Timeline.Sequence");
+  const frames = Object.freeze(sceneEntries(get(entry, "entries"), runtime, "Timeline.Sequence"));
+  if (frames.length === 0)
+    throw new Error("Timeline.Sequence requires at least one rendered frame");
+  const duration = get(entry, "duration");
+  return output("timeline", {
+    frames,
+    duration: duration === null || duration === undefined ? null : exactNumber(duration, "Timeline.Sequence duration"),
+    easing: asString(get(entry, "easing")) || "linear",
+    title: asString(get(entry, "title"))
+  });
+}
+function createTimelineRender(args) {
+  const entry = spec(args, ["timeline", "frame"], "Timeline.Render");
+  const timeline = get(entry, "timeline");
+  if (!isOutputValue(timeline) || timeline.kind !== "timeline") {
+    throw new Error("Timeline.Render requires a Timeline.Sequence value");
+  }
+  const frame = get(entry, "frame");
+  const index = frame === null || frame === undefined ? 1 : exactPositiveIndex(frame, "Timeline.Render frame");
+  if (index > timeline.frames.length) {
+    throw new Error(`Timeline.Render frame ${index} is outside 1…${timeline.frames.length}`);
+  }
+  return output("timeline_render", {
+    timeline,
+    frame: index,
+    snapshot: timeline.frames[index - 1],
+    content: timeline.frames[index - 1].content,
+    title: asString(get(entry, "title")) || timeline.title
+  });
 }
 function createText(args) {
   const entry = spec(args, ["value", "style"], "Text");
@@ -15518,6 +15813,26 @@ function createResetControl(args, runtime = null) {
     replacesDependencies: Object.freeze([...target.dependencies])
   });
 }
+function createActionControl(args, runtime = null) {
+  const entry = spec(args, ["target", "action", "label"], "Controls.Action");
+  const target = reactiveTarget(entry, "Controls.Action");
+  const action = get(entry, "action");
+  if (action === null || action === undefined)
+    throw new Error("Controls.Action requires an action callable");
+  const value = target.get();
+  return output("control_action", {
+    id: asString(get(entry, "id")) || `${target.id}:action`,
+    label: asString(get(entry, "label")) || "Run action",
+    help: asString(get(entry, "help")),
+    target,
+    targetId: target.id,
+    value,
+    action,
+    run: () => invokeControlCallable(action, [target.get()], runtime, "Controls.Action action"),
+    ...controlBehavior(entry, { value }, "Controls.Action", runtime),
+    replacesDependencies: Object.freeze([...target.dependencies])
+  });
+}
 function createControlPanel(args) {
   const entry = spec(args, ["controls", "title", "description"], "ControlPanel");
   const controls = sequence(get(entry, "controls"), "ControlPanel controls");
@@ -15541,6 +15856,7 @@ function createControlPanel(args) {
     submitLabel: asString(get(entry, "submitLabel")) || "Apply changes",
     discardLabel: asString(get(entry, "discardLabel")) || "Discard",
     interactive: true,
+    style: optionalMap(get(entry, "style"), "ControlPanel style"),
     metadata: optionalMap(get(entry, "metadata"), "ControlPanel metadata")
   }, [["SNAPSHOT", method3("Snapshot", ([target]) => createControlPanelSnapshot(target))]]);
 }
@@ -15548,6 +15864,8 @@ function controlSnapshot(control) {
   const {
     target: _target,
     validateCandidate: _validateCandidate,
+    action: _action,
+    run: _run,
     _ext: _extensions,
     ...fields
   } = control;
@@ -15557,6 +15875,49 @@ function controlSnapshot(control) {
     disabled: true,
     readOnly: true
   });
+}
+function styleMap(value) {
+  return value instanceof Map ? value : value?.type === "map" && value.entries instanceof Map ? value.entries : null;
+}
+function styleValue(style, key) {
+  const entries2 = styleMap(style);
+  return entries2 ? get(entries2, key) : null;
+}
+function mergeStyleMaps(...styles) {
+  const result = new Map;
+  for (const style of styles) {
+    const entries2 = styleMap(style);
+    if (!entries2)
+      continue;
+    for (const [key, value] of entries2)
+      result.set(key, value);
+  }
+  return result.size > 0 ? result : null;
+}
+function resolvedControlStyle(panelStyle, control) {
+  if (!styleMap(panelStyle))
+    return control.style;
+  const kinds = styleValue(panelStyle, "kinds");
+  const ids = styleValue(panelStyle, "ids");
+  const kind = control.kind.replace(/^control_/, "");
+  return mergeStyleMaps(styleValue(panelStyle, "all"), styleValue(kinds, kind), styleValue(ids, control.id), control.style);
+}
+function controlStyleAttributes(control) {
+  const style = control.style;
+  const variant = asString(styleValue(style, "variant"));
+  const density = asString(styleValue(style, "density"));
+  const width = asString(styleValue(style, "width"));
+  const attributes = [];
+  if (variant && ["primary", "danger", "quiet"].includes(variant)) {
+    attributes.push(` data-rix-control-variant="${escapeHtml(variant)}"`);
+  }
+  if (density && ["compact", "comfortable"].includes(density)) {
+    attributes.push(` data-rix-control-density="${escapeHtml(density)}"`);
+  }
+  if (width && ["auto", "compact", "full"].includes(width)) {
+    attributes.push(` data-rix-control-width="${escapeHtml(width)}"`);
+  }
+  return attributes.join("");
 }
 function createControlPanelSnapshot(panel) {
   if (!isOutputValue(panel) || panel.kind !== "control_panel") {
@@ -16015,7 +16376,7 @@ function createSyntheticDivision(root, coefficients) {
   return output("grid", {
     columns: Array.from({ length: values.length + 1 }, () => null),
     rows: [[root, ...values], [null, null, ...products.slice(1)], [null, ...bottom]],
-    rules: [{ kind: "vertical", afterColumn: 1 }, { kind: "horizontal", aboveRow: 3 }],
+    rules: [{ kind: "vertical", afterColumn: 2 }, { kind: "horizontal", aboveRow: 3 }],
     style: new Map([["align", { type: "string", value: "right" }]]),
     semantic: { type: "synthetic_division", root, coefficients: values, products, bottom }
   });
@@ -16044,31 +16405,90 @@ function createPolynomialPlot(coefficients, domain, options = null) {
   const margin = marginValue === null ? 36 : numericValue(marginValue, "Polynomial plot margin");
   if (margin < 0 || margin * 2 >= Math.min(...size))
     throw new Error("Polynomial plot margin is too large for its size");
-  const coefficientNumbers = values.map((value) => numericValue(value, "Polynomial coefficient"));
-  const evaluatePolynomial = (x) => coefficientNumbers.reduce((total, coefficient) => total * x + coefficient, 0);
-  const samplesData = Array.from({ length: samples }, (_, index) => {
-    const x = xMin + (xMax - xMin) * index / (samples - 1);
-    return [x, evaluatePolynomial(x)];
-  });
-  let yMin = Math.min(0, ...samplesData.map(([, y]) => y));
-  let yMax = Math.max(0, ...samplesData.map(([, y]) => y));
-  if (yMin === yMax) {
-    yMin -= 1;
-    yMax += 1;
+  const plotStyle = (entries2, fallbackStroke, fallbackWidth) => {
+    const supplied = optionalMap(get(entries2, "style", null), "Polynomial plot style") || new Map;
+    return new Map([
+      ...supplied,
+      ["stroke", get(entries2, "stroke", get(supplied, "stroke", fallbackStroke))],
+      ["width", get(entries2, "width", get(supplied, "width", fallbackWidth))],
+      ["fill", get(supplied, "fill", { type: "string", value: "none" })]
+    ]);
+  };
+  const readSeries = (entry, index, primary = false) => {
+    const entries2 = primary ? optionEntries : map(entry, `Polynomial plot series ${index + 1}`);
+    const coefficients2 = primary ? values : sequence(get(entries2, "coefficients"), `Polynomial plot series ${index + 1} coefficients`).map((value, coefficientIndex) => exactNumber(value, `Polynomial plot series ${index + 1} coefficient ${coefficientIndex + 1}`));
+    if (coefficients2.length < 2)
+      throw new Error(`Polynomial plot series ${index + 1} requires at least two coefficients`);
+    const numbers = coefficients2.map((value, coefficientIndex) => numericValue(value, `Polynomial plot series ${index + 1} coefficient ${coefficientIndex + 1}`));
+    const data = Array.from({ length: samples }, (_, sampleIndex) => {
+      const x = xMin + (xMax - xMin) * sampleIndex / (samples - 1);
+      return [x, numbers.reduce((total, coefficient) => total * x + coefficient, 0)];
+    });
+    return {
+      data,
+      style: plotStyle(entries2, primary ? { type: "string", value: "#2563eb" } : { type: "string", value: "#b45309" }, primary ? int3(3) : int3(2)),
+      label: get(entries2, "label", null)
+    };
+  };
+  const extraSeries = get(optionEntries, "series", null);
+  const series = [readSeries(null, 0, true), ...extraSeries === null ? [] : sequence(extraSeries, "Polynomial plot series").map((entry, index) => readSeries(entry, index + 1))];
+  const readMark = (entry, index) => {
+    const entries2 = map(entry, `Polynomial plot mark ${index + 1}`);
+    const point = sequence(get(entries2, "point"), `Polynomial plot mark ${index + 1} point`);
+    if (point.length !== 2)
+      throw new Error(`Polynomial plot mark ${index + 1} point must contain x and y coordinates`);
+    return {
+      point: point.map((value, coordinate) => numericValue(value, `Polynomial plot mark ${index + 1} ${coordinate === 0 ? "x" : "y"}`)),
+      label: get(entries2, "label", null),
+      style: optionalMap(get(entries2, "style", null), `Polynomial plot mark ${index + 1} style`) || new Map([
+        ["fill", { type: "string", value: "#be123c" }],
+        ["stroke", { type: "string", value: "#fff" }],
+        ["width", int3(2)]
+      ]),
+      labelStyle: optionalMap(get(entries2, "labelStyle", null), `Polynomial plot mark ${index + 1} label style`) || new Map([["size", int3(13)]]),
+      radius: get(entries2, "radius", int3(5))
+    };
+  };
+  const marksValue = get(optionEntries, "marks", null);
+  const marks = marksValue === null ? [] : sequence(marksValue, "Polynomial plot marks").map(readMark);
+  const readTick = (entry, index) => {
+    const entries2 = map(entry, `Polynomial plot tick ${index + 1}`);
+    return {
+      x: numericValue(get(entries2, "x"), `Polynomial plot tick ${index + 1} x`),
+      label: get(entries2, "label", null),
+      style: optionalMap(get(entries2, "style", null), `Polynomial plot tick ${index + 1} style`) || new Map([["stroke", { type: "string", value: "#334155" }], ["width", int3(2)]]),
+      labelStyle: optionalMap(get(entries2, "labelStyle", null), `Polynomial plot tick ${index + 1} label style`) || new Map([["size", int3(13)], ["anchor", { type: "string", value: "middle" }]])
+    };
+  };
+  const ticksValue = get(optionEntries, "ticks", null);
+  const ticks = ticksValue === null ? [] : sequence(ticksValue, "Polynomial plot ticks").map(readTick);
+  const yDomainValue = get(optionEntries, "yDomain", null);
+  let yMin;
+  let yMax;
+  if (yDomainValue !== null) {
+    const yBounds = sequence(yDomainValue, "Polynomial plot yDomain");
+    if (yBounds.length !== 2)
+      throw new Error("Polynomial plot yDomain must have a lower and upper bound");
+    yMin = numericValue(yBounds[0], "Polynomial plot yDomain lower bound");
+    yMax = numericValue(yBounds[1], "Polynomial plot yDomain upper bound");
+    if (!(yMin < yMax))
+      throw new Error("Polynomial plot yDomain must increase");
+  } else {
+    yMin = Math.min(0, ...series.flatMap(({ data }) => data.map(([, y]) => y)), ...marks.map(({ point }) => point[1]));
+    yMax = Math.max(0, ...series.flatMap(({ data }) => data.map(([, y]) => y)), ...marks.map(({ point }) => point[1]));
+    if (yMin === yMax) {
+      yMin -= 1;
+      yMax += 1;
+    }
+    const yPadding = (yMax - yMin) * 0.08;
+    yMin -= yPadding;
+    yMax += yPadding;
   }
-  const yPadding = (yMax - yMin) * 0.08;
-  yMin -= yPadding;
-  yMax += yPadding;
   const [width, height] = size;
   const toPoint = ([x, y]) => [
     margin + (x - xMin) / (xMax - xMin) * (width - margin * 2),
     height - margin - (y - yMin) / (yMax - yMin) * (height - margin * 2)
   ];
-  const curveStyle = new Map([
-    ["stroke", get(optionEntries, "stroke", { type: "string", value: "#2563eb" })],
-    ["width", get(optionEntries, "width", int3(2))],
-    ["fill", { type: "string", value: "none" }]
-  ]);
   const axisStyle = new Map([
     ["stroke", { type: "string", value: "#64748b" }],
     ["width", int3(1)],
@@ -16080,7 +16500,28 @@ function createPolynomialPlot(coefficients, domain, options = null) {
     children.push(output("path", { points: [toPoint([xMin, 0]), toPoint([xMax, 0])], style: axisStyle }));
   if (xMin <= 0 && xMax >= 0)
     children.push(output("path", { points: [toPoint([0, yMin]), toPoint([0, yMax])], style: axisStyle }));
-  children.push(output("path", { points: samplesData.map(toPoint), style: curveStyle }));
+  for (const seriesEntry of series)
+    children.push(output("path", { points: seriesEntry.data.map(toPoint), style: seriesEntry.style }));
+  for (const tick of ticks) {
+    const [tickX, tickY] = toPoint([tick.x, 0]);
+    children.push(output("path", { points: [[tickX, tickY - 5], [tickX, tickY + 5]], style: tick.style }));
+    if (tick.label !== null && tick.label !== undefined) {
+      children.push(output("text_mark", { position: [tickX, tickY + 20], text: tick.label, style: tick.labelStyle }));
+    }
+  }
+  for (const mark of marks) {
+    const [markX, markY] = toPoint(mark.point);
+    children.push(output("circle", { center: [markX, markY], radius: mark.radius, style: mark.style }));
+    if (mark.label !== null && mark.label !== undefined) {
+      children.push(output("text_mark", { position: [markX + 9, markY - 9], text: mark.label, style: mark.labelStyle }));
+    }
+  }
+  const labeledSeries = series.filter(({ label }) => label !== null && label !== undefined);
+  for (const [index, seriesEntry] of labeledSeries.entries()) {
+    const y = margin + 16 + index * 18;
+    children.push(output("path", { points: [[margin + 2, y - 5], [margin + 18, y - 5]], style: seriesEntry.style }));
+    children.push(output("text_mark", { position: [margin + 24, y], text: seriesEntry.label, style: new Map([["size", int3(13)]]) }));
+  }
   return output("graphic", {
     size: [int3(Math.round(width)), int3(Math.round(height))],
     children,
@@ -16344,6 +16785,8 @@ function formatInlineText(value, format) {
   if (value.kind === "link") {
     return `${value.children.map((child) => formatInlineText(child, format)).join("")} <${value.href}>`;
   }
+  if (value.kind === "image")
+    return value.alt;
   if (value.kind === "line_break")
     return `
 `;
@@ -16419,6 +16862,17 @@ ${value.transcript.map((child) => formatInlineText(child, format)).join("")}` : 
     return value.children.map((child) => formatOutputText(child, format)).join(`
 
 `);
+  if (value.kind === "snapshots") {
+    return [value.title, ...value.snapshots.map((snapshot) => formatOutputText(snapshot.content, format))].filter(Boolean).join(`
+
+`);
+  }
+  if (value.kind === "timeline")
+    return `[Timeline: ${value.frames.length} frames]`;
+  if (value.kind === "timeline_render")
+    return [value.title, formatOutputText(value.content, format)].filter(Boolean).join(`
+
+`);
   if (value.kind === "control_slider") {
     return `${value.label}: ${cellText(controlField(value, "value"), format)} (${cellText(controlField(value, "low"), format)} … ${cellText(controlField(value, "high"), format)}; step ${cellText(controlField(value, "step"), format)})`;
   }
@@ -16437,6 +16891,8 @@ ${value.transcript.map((child) => formatInlineText(child, format)).join("")}` : 
   if (value.kind === "control_reset") {
     return `${value.label}: ${cellText(controlField(value, "value"), format)} → ${cellText(controlField(value, "initial"), format)}`;
   }
+  if (value.kind === "control_action")
+    return `[Action: ${value.label}]`;
   if (value.kind === "control_panel") {
     return [value.title, value.description, ...value.controls.map((control) => formatOutputText(control, format))].filter(Boolean).join(`
 `);
@@ -16456,7 +16912,12 @@ ${value.transcript.map((child) => formatInlineText(child, format)).join("")}` : 
       if (hasRule(value, "horizontal", index + 1))
         lines.push(`  ${widths.slice(1).map((width) => "-".repeat(width + 2)).join("")}`);
       const parts = strings[index].map((cell, column) => cell.padStart(widths[column]));
-      lines.push(hasRule(value, "vertical", 1) ? `${parts[0]} │ ${parts.slice(1).join("  ")}` : parts.join("  "));
+      let line = parts[0] || "";
+      for (let column = 1;column < parts.length; column += 1) {
+        line += hasRule(value, "vertical", column + 1) ? " │ " : "  ";
+        line += parts[column];
+      }
+      lines.push(line);
     }
     return lines.join(`
 `);
@@ -16509,6 +16970,10 @@ function renderInlineHtml(value, format) {
     const href = safeHtmlUrl(value.href);
     const label = value.children.map((child) => renderInlineHtml(child, format)).join("");
     return href ? `<a class="rix-output-link" href="${escapeHtml(href)}"${value.title ? ` title="${escapeHtml(value.title)}"` : ""}>${label}</a>` : `<span class="rix-output-link-invalid" title="Unsupported link scheme">${label}</span>`;
+  }
+  if (value.kind === "image") {
+    const src = safeHtmlUrl(value.asset.ref, { media: true });
+    return src ? `<img class="rix-output-image" src="${escapeHtml(src)}" alt="${escapeHtml(value.alt)}"${value.title ? ` title="${escapeHtml(value.title)}"` : ""}${mediaDimensions(value)} loading="lazy">` : `<span class="rix-output-image-unavailable" role="img" aria-label="${escapeHtml(value.alt)}">[Image unavailable: ${escapeHtml(value.asset.ref)}]</span>`;
   }
   if (value.kind === "line_break")
     return "<br>";
@@ -16574,35 +17039,49 @@ function renderOutputHtml(value, format = (item) => String(item ?? "")) {
   }
   if (value.kind === "fragment")
     return `<section class="rix-output-fragment">${value.children.map((child) => renderOutputHtml(child, format)).join("")}</section>`;
+  if (value.kind === "snapshots") {
+    return `<section class="rix-output-snapshots">${value.title ? `<h2>${escapeHtml(value.title)}</h2>` : ""}<div class="rix-output-snapshot-list">${value.snapshots.map((snapshot) => {
+      const origin = snapshot.origin.entries;
+      return `<article class="rix-output-snapshot" data-rix-snapshot-entry="${exactInteger3(origin.get("entry"), "Snapshot origin entry")}" data-rix-snapshot-state="${exactInteger3(origin.get("state"), "Snapshot origin state")}" data-rix-snapshot-ordinal="${exactInteger3(origin.get("ordinal"), "Snapshot origin ordinal")}">${renderOutputHtml(snapshot.content, format)}</article>`;
+    }).join("")}</div>${value.caption ? `<p class="rix-output-snapshots-caption">${escapeHtml(value.caption)}</p>` : ""}</section>`;
+  }
+  if (value.kind === "timeline")
+    return `<section class="rix-output-timeline"><p>${escapeHtml(value.title || "Timeline")} · ${value.frames.length} frames</p></section>`;
+  if (value.kind === "timeline_render")
+    return `<section class="rix-output-timeline-render" data-rix-timeline-frame="${value.frame}" data-rix-timeline-length="${value.timeline.frames.length}">${value.title ? `<h2>${escapeHtml(value.title)}</h2>` : ""}${renderOutputHtml(value.content, format)}<p class="rix-output-timeline-caption">Frame ${value.frame} of ${value.timeline.frames.length}</p></section>`;
   if (value.kind === "control_slider") {
     const dependencies = value.replacesDependencies.length > 0 ? ` data-rix-replaces-dependencies="${escapeHtml(value.replacesDependencies.join(","))}"` : "";
-    return `<label class="rix-output-control rix-output-control-slider" data-rix-control-kind="slider" data-rix-control-id="${escapeHtml(value.id)}" data-rix-control-target="${escapeHtml(value.targetId)}"${controlStateAttributes(value)}${dependencies}><span class="rix-output-control-label">${escapeHtml(value.label)}</span><input type="range" min="0" max="${value.steps}" step="1" value="${value.index}" data-rix-control-input aria-label="${escapeHtml(value.label)}"${controlInputAttributes(value)}><output data-rix-control-value>${text4(controlField(value, "value"))}</output><small class="rix-output-control-scale">${text4(controlField(value, "low"))} … ${text4(controlField(value, "high"))} · step ${text4(controlField(value, "step"))}</small>${controlMessages(value)}</label>`;
+    return `<label class="rix-output-control rix-output-control-slider" data-rix-control-kind="slider" data-rix-control-id="${escapeHtml(value.id)}" data-rix-control-target="${escapeHtml(value.targetId)}"${controlStyleAttributes(value)}${controlStateAttributes(value)}${dependencies}><span class="rix-output-control-label">${escapeHtml(value.label)}</span><input type="range" min="0" max="${value.steps}" step="1" value="${value.index}" data-rix-control-input aria-label="${escapeHtml(value.label)}"${controlInputAttributes(value)}><output data-rix-control-value>${text4(controlField(value, "value"))}</output><small class="rix-output-control-scale">${text4(controlField(value, "low"))} … ${text4(controlField(value, "high"))} · step ${text4(controlField(value, "step"))}</small>${controlMessages(value)}</label>`;
   }
   if (value.kind === "control_input") {
     const dependencies = value.replacesDependencies.length > 0 ? ` data-rix-replaces-dependencies="${escapeHtml(value.replacesDependencies.join(","))}"` : "";
-    return `<label class="rix-output-control rix-output-control-input" data-rix-control-kind="input" data-rix-control-id="${escapeHtml(value.id)}" data-rix-control-target="${escapeHtml(value.targetId)}"${controlStateAttributes(value)}${dependencies}><span class="rix-output-control-label">${escapeHtml(value.label)}</span><span class="rix-output-control-input-row"><input type="text" value="${text4(controlField(value, "value"))}" placeholder="${escapeHtml(value.placeholder)}" data-rix-control-input aria-label="${escapeHtml(value.label)}"${controlInputAttributes(value, { text: true })}><button type="button" data-rix-control-commit${controlInputAttributes(value)}>Set</button></span><output data-rix-control-value>${text4(controlField(value, "value"))}</output>${controlMessages(value)}</label>`;
+    return `<label class="rix-output-control rix-output-control-input" data-rix-control-kind="input" data-rix-control-id="${escapeHtml(value.id)}" data-rix-control-target="${escapeHtml(value.targetId)}"${controlStyleAttributes(value)}${controlStateAttributes(value)}${dependencies}><span class="rix-output-control-label">${escapeHtml(value.label)}</span><span class="rix-output-control-input-row"><input type="text" value="${text4(controlField(value, "value"))}" placeholder="${escapeHtml(value.placeholder)}" data-rix-control-input aria-label="${escapeHtml(value.label)}"${controlInputAttributes(value, { text: true })}><button type="button" data-rix-control-commit${controlInputAttributes(value)}>Set</button></span><output data-rix-control-value>${text4(controlField(value, "value"))}</output>${controlMessages(value)}</label>`;
   }
   if (value.kind === "control_choice") {
     const dependencies = value.replacesDependencies.length > 0 ? ` data-rix-replaces-dependencies="${escapeHtml(value.replacesDependencies.join(","))}"` : "";
     const options = value.options.map((option, index) => `<option value="${index}"${index === value.index ? " selected" : ""}>${escapeHtml(cellText(value.displayOptions[index], format))}</option>`).join("");
-    return `<label class="rix-output-control rix-output-control-choice" data-rix-control-kind="choice" data-rix-control-id="${escapeHtml(value.id)}" data-rix-control-target="${escapeHtml(value.targetId)}"${controlStateAttributes(value)}${dependencies}><span class="rix-output-control-label">${escapeHtml(value.label)}</span><select data-rix-control-input aria-label="${escapeHtml(value.label)}"${controlInputAttributes(value)}>${options}</select><output data-rix-control-value>${text4(controlField(value, "value"))}</output>${controlMessages(value)}</label>`;
+    return `<label class="rix-output-control rix-output-control-choice" data-rix-control-kind="choice" data-rix-control-id="${escapeHtml(value.id)}" data-rix-control-target="${escapeHtml(value.targetId)}"${controlStyleAttributes(value)}${controlStateAttributes(value)}${dependencies}><span class="rix-output-control-label">${escapeHtml(value.label)}</span><select data-rix-control-input aria-label="${escapeHtml(value.label)}"${controlInputAttributes(value)}>${options}</select><output data-rix-control-value>${text4(controlField(value, "value"))}</output>${controlMessages(value)}</label>`;
   }
   if (value.kind === "control_toggle") {
     const dependencies = value.replacesDependencies.length > 0 ? ` data-rix-replaces-dependencies="${escapeHtml(value.replacesDependencies.join(","))}"` : "";
-    return `<label class="rix-output-control rix-output-control-toggle" data-rix-control-kind="toggle" data-rix-control-id="${escapeHtml(value.id)}" data-rix-control-target="${escapeHtml(value.targetId)}"${controlStateAttributes(value)}${dependencies}><span class="rix-output-control-label">${escapeHtml(value.label)}</span><input type="checkbox"${value.index === 1 ? " checked" : ""} data-rix-control-input aria-label="${escapeHtml(value.label)}"${controlInputAttributes(value)}><output data-rix-control-value>${text4(controlField(value, "value"))}</output><small class="rix-output-control-scale">${text4(controlField(value, "off"))} ↔ ${text4(controlField(value, "on"))}</small>${controlMessages(value)}</label>`;
+    return `<label class="rix-output-control rix-output-control-toggle" data-rix-control-kind="toggle" data-rix-control-id="${escapeHtml(value.id)}" data-rix-control-target="${escapeHtml(value.targetId)}"${controlStyleAttributes(value)}${controlStateAttributes(value)}${dependencies}><span class="rix-output-control-label">${escapeHtml(value.label)}</span><input type="checkbox"${value.index === 1 ? " checked" : ""} data-rix-control-input aria-label="${escapeHtml(value.label)}"${controlInputAttributes(value)}><output data-rix-control-value>${text4(controlField(value, "value"))}</output><small class="rix-output-control-scale">${text4(controlField(value, "off"))} ↔ ${text4(controlField(value, "on"))}</small>${controlMessages(value)}</label>`;
   }
   if (value.kind === "control_range") {
     const dependencies = value.replacesDependencies.length > 0 ? ` data-rix-replaces-dependencies="${escapeHtml(value.replacesDependencies.join(","))}"` : "";
     const current = value.formatKeys.includes("value") ? text4(controlField(value, "value")) : `${text4(controlField(value, "start"))} … ${text4(controlField(value, "end"))}`;
-    return `<fieldset class="rix-output-control rix-output-control-range" data-rix-control-kind="range" data-rix-control-id="${escapeHtml(value.id)}" data-rix-control-target="${escapeHtml(value.targetId)}"${controlStateAttributes(value)}${dependencies}><legend class="rix-output-control-label">${escapeHtml(value.label)}</legend><span class="rix-output-control-range-inputs"><input type="range" min="0" max="${value.steps}" step="1" value="${value.indices[0]}" data-rix-control-input data-rix-control-endpoint="low" aria-label="${escapeHtml(value.label)} lower endpoint"${controlInputAttributes(value)}><input type="range" min="0" max="${value.steps}" step="1" value="${value.indices[1]}" data-rix-control-input data-rix-control-endpoint="high" aria-label="${escapeHtml(value.label)} upper endpoint"${controlInputAttributes(value)}></span><output data-rix-control-value>${current}</output><small class="rix-output-control-scale">${text4(controlField(value, "low"))} … ${text4(controlField(value, "high"))} · step ${text4(controlField(value, "step"))}</small>${controlMessages(value)}</fieldset>`;
+    return `<fieldset class="rix-output-control rix-output-control-range" data-rix-control-kind="range" data-rix-control-id="${escapeHtml(value.id)}" data-rix-control-target="${escapeHtml(value.targetId)}"${controlStyleAttributes(value)}${controlStateAttributes(value)}${dependencies}><legend class="rix-output-control-label">${escapeHtml(value.label)}</legend><span class="rix-output-control-range-inputs"><input type="range" min="0" max="${value.steps}" step="1" value="${value.indices[0]}" data-rix-control-input data-rix-control-endpoint="low" aria-label="${escapeHtml(value.label)} lower endpoint"${controlInputAttributes(value)}><input type="range" min="0" max="${value.steps}" step="1" value="${value.indices[1]}" data-rix-control-input data-rix-control-endpoint="high" aria-label="${escapeHtml(value.label)} upper endpoint"${controlInputAttributes(value)}></span><output data-rix-control-value>${current}</output><small class="rix-output-control-scale">${text4(controlField(value, "low"))} … ${text4(controlField(value, "high"))} · step ${text4(controlField(value, "step"))}</small>${controlMessages(value)}</fieldset>`;
   }
   if (value.kind === "control_reset") {
     const dependencies = value.replacesDependencies.length > 0 ? ` data-rix-replaces-dependencies="${escapeHtml(value.replacesDependencies.join(","))}"` : "";
-    return `<div class="rix-output-control rix-output-control-reset" data-rix-control-kind="reset" data-rix-control-id="${escapeHtml(value.id)}" data-rix-control-target="${escapeHtml(value.targetId)}"${controlStateAttributes(value)}${dependencies}><span class="rix-output-control-label">${escapeHtml(value.label)}</span><button type="button" data-rix-control-input aria-label="${escapeHtml(value.label)}"${controlInputAttributes(value)}>Reset to ${text4(controlField(value, "initial"))}</button><output data-rix-control-value>${text4(controlField(value, "value"))}</output>${controlMessages(value)}</div>`;
+    return `<div class="rix-output-control rix-output-control-reset" data-rix-control-kind="reset" data-rix-control-id="${escapeHtml(value.id)}" data-rix-control-target="${escapeHtml(value.targetId)}"${controlStyleAttributes(value)}${controlStateAttributes(value)}${dependencies}><span class="rix-output-control-label">${escapeHtml(value.label)}</span><button type="button" data-rix-control-input aria-label="${escapeHtml(value.label)}"${controlInputAttributes(value)}>Reset to ${text4(controlField(value, "initial"))}</button><output data-rix-control-value>${text4(controlField(value, "value"))}</output>${controlMessages(value)}</div>`;
+  }
+  if (value.kind === "control_action") {
+    const dependencies = value.replacesDependencies.length > 0 ? ` data-rix-replaces-dependencies="${escapeHtml(value.replacesDependencies.join(","))}"` : "";
+    return `<div class="rix-output-control rix-output-control-action" data-rix-control-kind="action" data-rix-control-id="${escapeHtml(value.id)}" data-rix-control-target="${escapeHtml(value.targetId)}"${controlStyleAttributes(value)}${controlStateAttributes(value)}${dependencies}><span class="rix-output-control-label">${escapeHtml(value.label)}</span><button type="button" data-rix-control-input aria-label="${escapeHtml(value.label)}"${controlInputAttributes(value)}>${escapeHtml(value.label)}</button>${controlMessages(value)}</div>`;
   }
   if (value.kind === "control_panel") {
     const actions = value.mode === "staged" ? `<div class="rix-output-control-actions"><button type="button" data-rix-control-submit disabled>${escapeHtml(value.submitLabel)}</button><button type="button" data-rix-control-discard disabled>${escapeHtml(value.discardLabel)}</button></div>` : "";
-    return `<section class="rix-output-control-panel" data-rix-interactive="${value.interactive === false ? "false" : "true"}" data-rix-control-mode="${escapeHtml(value.mode || "immediate")}">${value.title ? `<h3>${escapeHtml(value.title)}</h3>` : ""}${value.description ? `<p>${escapeHtml(value.description)}</p>` : ""}<div class="rix-output-control-list">${value.controls.map((control) => renderOutputHtml(control, format)).join("")}</div>${actions}<output class="rix-output-control-status" aria-live="polite"></output></section>`;
+    return `<section class="rix-output-control-panel" data-rix-interactive="${value.interactive === false ? "false" : "true"}" data-rix-control-mode="${escapeHtml(value.mode || "immediate")}">${value.title ? `<h3>${escapeHtml(value.title)}</h3>` : ""}${value.description ? `<p>${escapeHtml(value.description)}</p>` : ""}<div class="rix-output-control-list">${value.controls.map((control) => renderOutputHtml({ ...control, style: resolvedControlStyle(value.style, control) }, format)).join("")}</div>${actions}<output class="rix-output-control-status" aria-live="polite"></output></section>`;
   }
   if (value.kind === "table")
     return `<table class="rix-output-table">${value.caption ? `<caption>${escapeHtml(value.caption)}</caption>` : ""}<thead><tr>${value.columns.map((column) => `<th>${escapeHtml(column.label)}</th>`).join("")}</tr></thead><tbody>${value.rows.map((row) => `<tr>${row.map((cell) => `<td>${text4(cell)}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
@@ -16674,7 +17153,8 @@ function createGraphicsOutputCollection() {
     ["Rectangle", createRectangle],
     ["Circle", createCircle],
     ["DragPoint", createDragPoint],
-    ["Clip", createClip]
+    ["Clip", createClip],
+    ["Snapshots", createSnapshots]
   ]);
   const entries2 = new Map;
   const extension = new Map([["immutable", int3(1)]]);
@@ -16684,7 +17164,33 @@ function createGraphicsOutputCollection() {
     extension.set(name.toUpperCase(), {
       type: "method_builtin",
       name,
-      impl: (args) => constructor(args.slice(1))
+      impl: (args, context, evaluate, invoke) => constructor(args.slice(1), {
+        context,
+        evaluate,
+        invoke
+      })
+    });
+  }
+  return { type: "map", entries: entries2, _ext: extension };
+}
+function createTimelineOutputCollection() {
+  const methods = new Map([
+    ["Sequence", createTimelineSequence],
+    ["Render", createTimelineRender]
+  ]);
+  const entries2 = new Map;
+  const extension = new Map([["immutable", int3(1)]]);
+  for (const [name, constructor] of methods) {
+    entries2.set(name, constructor);
+    entries2.set(name.toUpperCase(), constructor);
+    extension.set(name.toUpperCase(), {
+      type: "method_builtin",
+      name,
+      impl: (args, context, evaluate, invoke) => constructor(args.slice(1), {
+        context,
+        evaluate,
+        invoke
+      })
     });
   }
   return { type: "map", entries: entries2, _ext: extension };
@@ -16696,7 +17202,8 @@ function createControlsOutputCollection() {
     ["Choice", createChoiceControl],
     ["Toggle", createToggleControl],
     ["Range", createRangeControl],
-    ["Reset", createResetControl]
+    ["Reset", createResetControl],
+    ["Action", createActionControl]
   ]);
   const entries2 = new Map;
   const extension = new Map([["immutable", int3(1)]]);
@@ -22761,6 +23268,29 @@ var LOWERERS = {
   Comment() {
     return ir2("NOP");
   },
+  PostfixCheckValue() {
+    return ir2("POSTFIX_CHECK_VALUE");
+  },
+  PostfixPredicateCheck(node) {
+    return ir2("POSTFIX_PREDICATE_CHECK", lowerNode(node.expression), lowerNode(node.predicate));
+  },
+  PostfixTypeCheck(node) {
+    return ir2("POSTFIX_TYPE_CHECK", lowerNode(node.expression), node.spec);
+  },
+  PostfixDiagnosticTap(node) {
+    const args = lowerCallArgs(node.arguments);
+    const expression = lowerNode(node.expression);
+    const action = node.action.toLowerCase();
+    if (action === "debug")
+      return ir2("SYS_CALL", "Debug", ...args, expression);
+    if (action === "trace")
+      return ir2("SYS_CALL", "Trace", ...args, expression);
+    if (action === "info")
+      return ir2("SYS_CALL", "InfoValue", ...args, expression);
+    if (action === "dump" || action === "log")
+      return ir2("SYS_CALL", "Dump", ...args, expression);
+    throw new Error(`Unknown postfix diagnostic action: ${node.action}`);
+  },
   BinaryOperation(node) {
     const op = node.operator;
     if (op === "=" || op === ":=" || op === "~=" || op === "::=" || op === "~~=") {
@@ -22799,13 +23329,6 @@ var LOWERERS = {
         pos: node.pos
       };
       return lowerAssignment(assignAstNode, "ASSIGN_UPDATE");
-    }
-    if (op === ":=:") {
-      const left = node.left;
-      if (left.type === "UserIdentifier" || left.type === "SystemIdentifier") {
-        return ir2("SOLVE", left.name, lowerNode(node.right));
-      }
-      return ir2("SOLVE", lowerNode(left), lowerNode(node.right));
     }
     if (op === ":<:") {
       return ir2("ASSERT_LT", lowerNode(node.left), lowerNode(node.right));
@@ -22877,6 +23400,13 @@ var LOWERERS = {
       }
     }
     return ir2("BINOP", op, lowerNode(node.left), lowerNode(node.right));
+  },
+  CustomOperator(node) {
+    return ir2("CUSTOM_OPERATOR", {
+      symbol: node.operator,
+      spelling: node.spelling,
+      target: node.definition.target
+    }, lowerNode(node.left), lowerNode(node.right));
   },
   UnaryOperation(node) {
     if (node.operator === "-") {
@@ -23149,8 +23679,8 @@ var LOWERERS = {
       outputMode: node.outputMode || "named",
       ...node.expression ? { expression: lowerNode(node.expression) } : {},
       statements: (node.statements || []).map((statement) => ({
-        kind: "assign",
-        target: statement.target,
+        kind: statement.type === "SpecConstraint" ? "constraint" : "define",
+        ...statement.target ? { target: statement.target } : {},
         expr: lowerNode(statement.expr)
       }))
     };
@@ -23159,12 +23689,15 @@ var LOWERERS = {
     }
     return ir2("SYSTEM_SPEC", meta);
   },
-  SpecAssign(node) {
+  SpecDefinition(node) {
     return {
-      kind: "assign",
+      kind: "define",
       target: node.target,
       expr: lowerNode(node.expr)
     };
+  },
+  SpecConstraint(node) {
+    return { kind: "constraint", expr: lowerNode(node.expr) };
   },
   BreakBlock(node) {
     const meta = {};
@@ -23776,6 +24309,7 @@ var path_default = { isAbsolute() {
 } };
 
 // ../../rix/src/runtime/plugin-catalog.js
+var CUSTOM_OPERATOR_ENV_KEY = "__custom_operator_definitions__";
 function validateMetadata(metadata, sourcePath, kind) {
   if (metadata.ignore !== undefined && typeof metadata.ignore !== "boolean") {
     throw new Error(`${sourcePath}: ignore must be true or false`);
@@ -23792,7 +24326,7 @@ function validateMetadata(metadata, sourcePath, kind) {
   if (metadata.mount !== undefined && (typeof metadata.mount !== "string" || !/^[a-z][A-Za-z0-9_]*$/.test(metadata.mount))) {
     throw new Error(`${sourcePath}: mount must be a camelCase host capability name`);
   }
-  for (const key of ["exports", "groups", "permissions"]) {
+  for (const key of ["exports", "groups", "permissions", "operator-files"]) {
     if (metadata[key] !== undefined && !Array.isArray(metadata[key])) {
       throw new Error(`${sourcePath}: ${key} must be an inline YAML array or a YAML list`);
     }
@@ -23806,10 +24340,33 @@ function validateMetadata(metadata, sourcePath, kind) {
     exports: metadata.exports || [],
     groups: metadata.groups || [],
     permissions: metadata.permissions || [],
+    operatorFiles: metadata["operator-files"] || metadata.operatorFiles || [],
+    operatorDefinitions: metadata.operatorDefinitions || [],
     defaultEnabled: metadata.defaultEnabled === true,
     ignore: metadata.ignore === true,
     sourcePath
   };
+}
+function mountedOperatorDefinitions(definitions, metadata, mount) {
+  return (definitions || []).map((definition) => {
+    if (definition.target?.kind !== "plugin-method" || definition.target.pluginId !== metadata.id) {
+      return definition;
+    }
+    return {
+      ...definition,
+      target: { ...definition.target, mount }
+    };
+  });
+}
+function installOperatorDefinitions(context, definitions, metadata, mount) {
+  if (!context?.getEnv || !context?.setEnv || !definitions?.length)
+    return;
+  const mountedDefinitions = mountedOperatorDefinitions(definitions, metadata, mount);
+  const merged = mergeOperatorDefinitions(context.getEnv(CUSTOM_OPERATOR_ENV_KEY, new Map), mountedDefinitions);
+  context.setEnv(CUSTOM_OPERATOR_ENV_KEY, merged);
+  const runtime = context.getEnv("__script_runtime__", null);
+  if (runtime)
+    runtime.operatorDefinitions = merged;
 }
 function rixString3(value) {
   return { type: "string", value: String(value) };
@@ -23860,7 +24417,15 @@ class PluginCatalog {
     if (validatedKind !== "rix" && validatedKind !== "host") {
       throw new Error(`${sourcePath}: plugin kind must be 'rix' or 'host'`);
     }
-    const entry = validateMetadata(metadata, sourcePath, validatedKind);
+    let enrichedMetadata = metadata;
+    if (validatedKind === "rix" && typeof source === "string" && !metadata.operatorDefinitions) {
+      const operatorDefinitions = Array.from(extractOperatorDeclarationsFromSource(source, {
+        label: sourcePath,
+        owner: { pluginId: metadata.id, mount: metadata.mount || null }
+      }).values());
+      enrichedMetadata = { ...metadata, operatorDefinitions };
+    }
+    const entry = validateMetadata(enrichedMetadata, sourcePath, validatedKind);
     if (entry.kind === "rix" && typeof source !== "string") {
       throw new Error(`${sourcePath}: RiX plugin metadata requires source supplied by its host scanner`);
     }
@@ -23913,6 +24478,7 @@ class PluginCatalog {
         ["exports", { type: "sequence", values: metadata.exports.map(rixString3) }],
         ["groups", { type: "sequence", values: metadata.groups.map(rixString3) }],
         ["permissions", { type: "sequence", values: metadata.permissions.map(rixString3) }],
+        ["operators", { type: "sequence", values: metadata.operatorDefinitions.map((definition) => rixString3(definition.spelling)) }],
         ["loaded", loaded ? { type: "integer", value: 1n } : null]
       ])
     };
@@ -23938,7 +24504,11 @@ class PluginCatalog {
     if (metadata.kind === "rix") {
       if (typeof runtime.loadRix !== "function")
         throw new Error(`No RiX plugin loader is available for '${metadata.id}'`);
-      runtime.loadRix({ ...api, source: metadata.source });
+      runtime.loadRix({
+        ...api,
+        source: metadata.source,
+        operatorDefinitions: mountedOperatorDefinitions(metadata.operatorDefinitions, metadata, mount)
+      });
     } else {
       const installer = this.installers.get(metadata.id);
       if (!installer) {
@@ -23954,6 +24524,7 @@ class PluginCatalog {
     if (mount && runtime.visibleSystemContext && runtime.visibleSystemContext !== runtime.systemContext) {
       runtime.visibleSystemContext.adoptHostCapability(runtime.systemContext, mount);
     }
+    installOperatorDefinitions(runtime.context, metadata.operatorDefinitions, metadata, mount);
     this.loaded.set(metadata.id, { metadata, mount });
     return this.infoValue(metadata);
   }
@@ -24767,7 +25338,7 @@ var propertyFunctions = {
 
 // ../../rix/src/eval/functions/core.js
 var BASE_RESERVED_CHARS = new Set([".", "/", "#", "~", "_", "^", "+", "-"]);
-var requireFromHere = createRequire(import.meta.url);
+var requireFromHere = createRequire("/rix-runtime/core.js");
 var BASE_MODE_ALIASES = new Map([
   ["mixed", 1],
   ["..", 1],
@@ -27182,6 +27753,39 @@ function evaluateArgs2(argNodes, evaluate) {
   return evaluatedArgs;
 }
 var methodFunctions = {
+  CUSTOM_OPERATOR: {
+    impl(args, context, evaluate, systemContext) {
+      const [definition, left, right] = args;
+      const target = definition?.target;
+      if (!target)
+        throw new Error("Custom operator is missing its dispatch target");
+      if (target.kind === "function") {
+        const fn = context.getCallable(target.name);
+        if (!fn) {
+          throw new Error(`Custom operator ${definition.spelling} target '${target.name}' is not defined`);
+        }
+        return callWithConcreteArgs(fn, [left, right], context, evaluate);
+      }
+      if (target.kind === "plugin-method" || target.kind === "system-method") {
+        const mount = target.mount;
+        if (!mount) {
+          throw new Error(`Custom operator ${definition.spelling} plugin '${target.pluginId}' has no active mount`);
+        }
+        const entry = systemContext?.get?.(mount);
+        const receiver = entry && Object.hasOwn(entry, "value") ? entry.value : entry;
+        if (!receiver) {
+          throw new Error(`Custom operator ${definition.spelling} requires plugin/system object '.${mount}'`);
+        }
+        const fn = resolveMethod(receiver, target.method);
+        if (fn?.type === "method_builtin") {
+          return fn.impl([receiver, left, right], context, evaluate, callWithConcreteArgs);
+        }
+        return callWithConcreteArgs(fn, [receiver, left, right], context, evaluate);
+      }
+      throw new Error(`Unsupported custom operator target kind '${target.kind}'`);
+    },
+    doc: "Dispatch a statically declared custom operator to a function or plugin method"
+  },
   CALL_METHOD: {
     lazy: true,
     impl(args, context, evaluate) {
@@ -27396,19 +28000,6 @@ function mediantLevels(lo, hi, levels) {
   return { levels: result, boundaries };
 }
 var advancedFunctions = {
-  SOLVE: {
-    lazy: true,
-    impl(args, context, evaluate) {
-      let name = typeof args[0] === "object" && args[0] !== null && args[0].fn ? evaluate(args[0]) : args[0];
-      if (name && typeof name === "object" && name.type === "string") {
-        name = name.value;
-      }
-      const value = evaluate(args[1]);
-      context.set(name, value);
-      return { type: "constraint", name, value, satisfied: true };
-    },
-    doc: "Solve/constrain: x :=: expr"
-  },
   ASSERT_LT: {
     impl(args) {
       const a = toNumber(args[0]);
@@ -27984,6 +28575,24 @@ function toRixString(s) {
 function isTruthy5(val) {
   return val !== null && val !== undefined;
 }
+function inspectValue(value, depth) {
+  if (value === null || value === undefined)
+    return "null";
+  if (depth <= 0 && typeof value === "object")
+    return "…";
+  if (value?.type === "sequence" || value?.type === "tuple" || value?.type === "set") {
+    const open = value.type === "set" ? "{| " : value.type === "tuple" ? "{: " : "[";
+    const close = value.type === "set" ? " |}" : value.type === "tuple" ? " }" : "]";
+    return open + (value.values || []).map((entry) => inspectValue(entry, depth - 1)).join(", ") + close;
+  }
+  if (value?.type === "map") {
+    const entries2 = Array.from(value.entries || []).map(([key, entry]) => `${key} = ${inspectValue(entry, depth - 1)}`);
+    return `{= ${entries2.join(", ")} }`;
+  }
+  if (value?.type === "tensor")
+    return `tensor[${(value.shape || []).join("x")}] ${formatValue(value)}`;
+  return formatValue(value);
+}
 function requireString(val, paramName) {
   const s = rixStringValue(val);
   if (s === null) {
@@ -28050,6 +28659,58 @@ var INFO = {
     return event;
   },
   doc: "Emit an info event: .Info(label, level ?= 1, dataMap ?= {=})"
+};
+var INFO_VALUE = {
+  lazy: true,
+  impl(args, context, evaluate) {
+    if (args.length !== 2 && args.length !== 3) {
+      throw new Error(".InfoValue expects label, optional depth, and an expression");
+    }
+    const label = requireString(evaluate(args[0]), ".InfoValue label");
+    const hasDepth = args.length === 3;
+    const depthValue = hasDepth ? evaluate(args[1]) : new Integer(1n);
+    const depth = rixIntValue(depthValue);
+    if (depth === null || depth < 0 || !Number.isInteger(depth)) {
+      throw new Error(".InfoValue depth must be a non-negative integer");
+    }
+    const expression = args[hasDepth ? 2 : 1];
+    const finalValue = evaluate(expression);
+    const data = { type: "map", entries: new Map([
+      ["depth", toRixInt(depth)],
+      ["final", finalValue],
+      ["display", toRixString(inspectValue(finalValue, depth))]
+    ]) };
+    getDiagnostics(context).addEvent(createEvent({
+      kind: "info",
+      label,
+      level: depth,
+      file: getCurrentFilePath(context),
+      data
+    }));
+    return finalValue;
+  },
+  doc: "Inspect expression value: .InfoValue(label, depth ?= 1, expr) — returns expr value"
+};
+var DUMP = {
+  lazy: true,
+  impl(args, context, evaluate) {
+    if (args.length !== 2)
+      throw new Error(".Dump expects a label and an expression");
+    const label = requireString(evaluate(args[0]), ".Dump label");
+    const finalValue = evaluate(args[1]);
+    const data = { type: "map", entries: new Map([
+      ["final", finalValue],
+      ["display", toRixString(formatValue(finalValue))]
+    ]) };
+    getDiagnostics(context).addEvent(createEvent({
+      kind: "log",
+      label,
+      file: getCurrentFilePath(context),
+      data
+    }));
+    return finalValue;
+  },
+  doc: "Dump expression value: .Dump(label, expr) — returns expr value"
 };
 var ERROR = {
   impl(args, context) {
@@ -28643,6 +29304,8 @@ var TEST_STOP = {
 var diagnosticFunctions = {
   WARN,
   INFO,
+  INFOVALUE: INFO_VALUE,
+  DUMP,
   ERROR,
   STOP,
   TEST,
@@ -28776,89 +29439,509 @@ function evaluateTemplateSource(source, context, evaluate) {
     result = evaluate(node);
   return result;
 }
-function interpolationRanges(body) {
-  const ranges = [];
-  let cursor = 0;
-  while (cursor < body.length) {
-    const start = body.indexOf("@{", cursor);
-    if (start === -1)
-      break;
-    let depth = 1;
-    let quote = null;
-    let index = start + 2;
-    for (;index < body.length && depth > 0; index += 1) {
-      const character = body[index];
-      if (quote) {
-        if (character === "\\")
-          index += 1;
-        else if (character === quote)
-          quote = null;
-        continue;
-      }
-      if (character === '"' || character === "`") {
-        quote = character;
-      } else if (character === "{") {
-        depth += 1;
-      } else if (character === "}") {
-        depth -= 1;
-      }
+function readHole(source, start) {
+  if (!source.startsWith("@{", start))
+    return null;
+  let depth = 1;
+  let quote = null;
+  let index = start + 2;
+  for (;index < source.length && depth > 0; index += 1) {
+    const character = source[index];
+    if (quote) {
+      if (character === "\\")
+        index += 1;
+      else if (character === quote)
+        quote = null;
+      continue;
     }
-    if (depth !== 0)
-      throw new Error("Unclosed @{...} interpolation in template");
-    ranges.push({ start, end: index, source: body.slice(start + 2, index - 1) });
-    cursor = index;
+    if (character === '"' || character === "'" || character === "`")
+      quote = character;
+    else if (character === "{")
+      depth += 1;
+    else if (character === "}")
+      depth -= 1;
   }
-  return ranges;
+  if (depth !== 0)
+    throw new Error("Unclosed @{...} interpolation in template");
+  return { end: index, source: source.slice(start + 2, index - 1) };
 }
-function interpolateText(body, context, evaluate) {
-  const ranges = interpolationRanges(body);
+function interpolatedLiteral(body, context, evaluate, { output: output2 = "format" } = {}) {
   let result = "";
-  let cursor = 0;
-  for (const range of ranges) {
-    result += body.slice(cursor, range.start);
-    const value = evaluateTemplateSource(range.source, context, evaluate);
+  for (let index = 0;index < body.length; ) {
+    if (body.startsWith("@@{", index)) {
+      result += "@{";
+      index += 3;
+      continue;
+    }
+    if (!body.startsWith("@{", index)) {
+      result += body[index];
+      index += 1;
+      continue;
+    }
+    const hole = readHole(body, index);
+    const value = evaluateTemplateSource(hole.source, context, evaluate);
+    if (output2 === "reject" && isOutputValue(value)) {
+      throw new Error("Code and math interpolations require a raw RiX value, not an output value");
+    }
     result += formatValue(value, { context, evaluate });
-    cursor = range.end;
+    index = hole.end;
   }
-  return result + body.slice(cursor);
+  return result;
 }
 function standaloneInterpolation(body, context, evaluate) {
-  const ranges = interpolationRanges(body.trim());
-  return ranges.length === 1 && ranges[0].start === 0 && ranges[0].end === body.trim().length ? evaluateTemplateSource(ranges[0].source, context, evaluate) : null;
+  const source = body.trim();
+  if (source.startsWith("@@{"))
+    return { matched: false, value: null };
+  const hole = source.startsWith("@{") ? readHole(source, 0) : null;
+  return hole && hole.end === source.length ? { matched: true, value: evaluateTemplateSource(hole.source, context, evaluate) } : { matched: false, value: null };
 }
 function textValue(text4) {
   return { type: "string", value: text4 };
 }
+function outputMap(fields) {
+  return { type: "map", entries: new Map(Object.entries(fields).filter(([, value]) => value !== undefined && value !== null)) };
+}
+function literalValue2(value) {
+  return { type: "string", value };
+}
+function inlineText(value, context, evaluate, { literal: literal2 = false } = {}) {
+  const children = [];
+  let buffer = "";
+  const append = (value2) => {
+    buffer += value2;
+  };
+  const flush = () => {
+    if (buffer)
+      children.push(textValue(buffer));
+    buffer = "";
+  };
+  const valueChild = (value2) => {
+    flush();
+    if (isOutputValue(value2)) {
+      if (!isInlineOutput(value2))
+        throw new Error(`Inline template content cannot contain block output ${value2.kind}`);
+      children.push(value2);
+    } else {
+      append(formatValue(value2, { context, evaluate }));
+    }
+  };
+  const closing = (source, delimiter, start) => {
+    for (let index = start;index < source.length; index += 1) {
+      if (!literal2 && source[index] === "\\") {
+        index += 1;
+        continue;
+      }
+      if (source.startsWith(delimiter, index))
+        return index;
+    }
+    return -1;
+  };
+  for (let index = 0;index < value.length; ) {
+    if (value.startsWith("@@{", index)) {
+      append("@{");
+      index += 3;
+      continue;
+    }
+    if (value.startsWith("@{", index)) {
+      const hole = readHole(value, index);
+      valueChild(evaluateTemplateSource(hole.source, context, evaluate));
+      index = hole.end;
+      continue;
+    }
+    const character = value[index];
+    if (!literal2 && character === "\\") {
+      const escaped = value[index + 1];
+      if (escaped && "\\*`$[]()".includes(escaped)) {
+        append(escaped);
+        index += 2;
+        continue;
+      }
+    }
+    if (!literal2 && value.startsWith("****", index)) {
+      throw new Error("Runs of four or more asterisks are not document-template delimiters; nest *...* and **...** explicitly");
+    }
+    if (!literal2 && value.startsWith("***", index)) {
+      const end = closing(value, "***", index + 3);
+      if (end < 0)
+        throw new Error("Unclosed ***strong emphasis*** delimiter in document template");
+      flush();
+      children.push(createStrong([[createEmphasis([inlineText(value.slice(index + 3, end), context, evaluate)])]]));
+      index = end + 3;
+      continue;
+    }
+    if (!literal2 && value.startsWith("**", index)) {
+      const end = closing(value, "**", index + 2);
+      if (end < 0)
+        throw new Error("Unclosed **strong** delimiter in document template");
+      flush();
+      children.push(createStrong([inlineText(value.slice(index + 2, end), context, evaluate)]));
+      index = end + 2;
+      continue;
+    }
+    if (!literal2 && character === "*") {
+      const end = closing(value, "*", index + 1);
+      if (end < 0)
+        throw new Error("Unclosed *emphasis* delimiter in document template");
+      flush();
+      children.push(createEmphasis([inlineText(value.slice(index + 1, end), context, evaluate)]));
+      index = end + 1;
+      continue;
+    }
+    if (!literal2 && (character === "`" || character === "$")) {
+      const end = closing(value, character, index + 1);
+      if (end < 0)
+        throw new Error(`Unclosed ${character} delimiter in document template`);
+      const literalSource = interpolatedLiteral(value.slice(index + 1, end), context, evaluate, { output: "reject" });
+      flush();
+      children.push(character === "`" ? createCode([literalValue2(literalSource)]) : createMath([literalValue2(literalSource)]));
+      index = end + 1;
+      continue;
+    }
+    if (!literal2 && character === "[") {
+      const labelEnd = closing(value, "](", index + 1);
+      if (labelEnd < 0)
+        throw new Error("Unclosed [label](...) link delimiter in document template");
+      let end = labelEnd + 2;
+      let braces = 0;
+      let quote = null;
+      for (;end < value.length; end += 1) {
+        const part = value[end];
+        if (quote) {
+          if (part === "\\")
+            end += 1;
+          else if (part === quote)
+            quote = null;
+          continue;
+        }
+        if (part === '"' || part === "'")
+          quote = part;
+        else if (part === "{")
+          braces += 1;
+        else if (part === "}")
+          braces -= 1;
+        else if (part === ")" && braces === 0)
+          break;
+      }
+      if (end >= value.length)
+        throw new Error("Unclosed [label](...) link destination in document template");
+      const label = value.slice(index + 1, labelEnd);
+      const target = value.slice(labelEnd + 2, end).trim();
+      const descriptor = parseAssetDescriptor(target, context, evaluate);
+      flush();
+      if (descriptor.type === "link") {
+        for (const name of Object.keys(descriptor.attributes)) {
+          if (name !== "title")
+            throw new Error(`Unknown link attribute: ${name}`);
+        }
+        children.push(createLink([outputMap({ href: literalValue2(descriptor.primary), children: inlineText(label, context, evaluate), title: descriptor.attributes.title ? literalValue2(descriptor.attributes.title) : null })]));
+      } else if (descriptor.type === "image") {
+        children.push(mediaOutput("image", descriptor, inlinePlainText(label, context, evaluate), context, evaluate));
+      } else {
+        throw new Error(`Inline ${descriptor.type} assets are not supported; use a block directive`);
+      }
+      index = end + 1;
+      continue;
+    }
+    if (character === `
+`) {
+      flush();
+      children.push(createLineBreak([]));
+      index += 1;
+      continue;
+    }
+    append(character);
+    index += 1;
+  }
+  flush();
+  return children;
+}
+function inlinePlainText(source, context, evaluate) {
+  return inlineText(source, context, evaluate).map((item) => formatValue(item, { context, evaluate })).join("");
+}
+function parseAssetDescriptor(source, context, evaluate) {
+  const match = source.match(/^([a-z][\w-]*)\s*:\s*/i);
+  if (!match)
+    throw new Error("Asset/link syntax requires a type: primary descriptor");
+  const type = match[1].toLowerCase();
+  let rest = source.slice(match[0].length).trim();
+  let attributes = {};
+  let attrStart = -1;
+  for (let index = 0;index < rest.length; index += 1) {
+    if (rest[index] === "{" && rest[index - 1] !== "@") {
+      attrStart = index;
+      break;
+    }
+  }
+  if (attrStart >= 0) {
+    if (!rest.endsWith("}"))
+      throw new Error("Asset attributes must end with }");
+    attributes = parseAttributes(rest.slice(attrStart + 1, -1), context, evaluate);
+    rest = rest.slice(0, attrStart).trim();
+  }
+  if (rest.startsWith('"') && rest.endsWith('"') || rest.startsWith("'") && rest.endsWith("'"))
+    rest = rest.slice(1, -1);
+  if (!rest)
+    throw new Error("Asset/link syntax requires a primary descriptor");
+  return { type, primary: interpolatedLiteral(rest, context, evaluate), attributes };
+}
+function parseAttributes(source, context, evaluate) {
+  const attributes = {};
+  for (const entry of source.split(",").map((part) => part.trim()).filter(Boolean)) {
+    const match = entry.match(/^([a-z][\w-]*)\s*=\s*([\s\S]+)$/i);
+    if (!match)
+      throw new Error(`Invalid asset attribute: ${entry}`);
+    let value = match[2].trim();
+    if (value.startsWith('"') && value.endsWith('"') || value.startsWith("'") && value.endsWith("'"))
+      value = value.slice(1, -1);
+    value = interpolatedLiteral(value, context, evaluate);
+    attributes[match[1].toLowerCase()] = /^\d+$/.test(value) ? Number(value) : value;
+  }
+  return attributes;
+}
+function mediaOutput(type, descriptor, label, context, evaluate) {
+  const attributes = descriptor.attributes;
+  const allowed = new Set(["mime", "width", "height", "filename", "title", "caption", "id", "alt", "transcript"]);
+  for (const name of Object.keys(attributes)) {
+    if (!allowed.has(name))
+      throw new Error(`Unknown ${type} asset attribute: ${name}`);
+  }
+  const mime = attributes.mime;
+  if (!mime)
+    throw new Error(`${type} asset requires a mime attribute`);
+  const asset = createAsset([outputMap({
+    ref: literalValue2(descriptor.primary),
+    mime: literalValue2(mime),
+    width: attributes.width,
+    height: attributes.height,
+    filename: attributes.filename ? literalValue2(attributes.filename) : null
+  })]);
+  const common = {
+    asset,
+    width: attributes.width,
+    height: attributes.height,
+    title: attributes.title ? literalValue2(attributes.title) : null,
+    caption: attributes.caption ? inlineText(attributes.caption, context, evaluate) : null,
+    id: attributes.id ? literalValue2(attributes.id) : null
+  };
+  if (type === "image")
+    return createImage([outputMap({ ...common, alt: literalValue2(label || attributes.alt || "") })]);
+  if (type === "audio")
+    return createAudio([outputMap({ ...common, transcript: attributes.transcript ? inlineText(attributes.transcript, context, evaluate) : null })]);
+  if (type === "video")
+    return createVideo([outputMap({ ...common, transcript: attributes.transcript ? inlineText(attributes.transcript, context, evaluate) : null })]);
+  return asset;
+}
+function headerLabel(source) {
+  const match = source.match(/^(.*?)(?:\s+#([-\w:.]+))?\s*$/);
+  return { text: match[1].trim(), id: match[2] || null };
+}
+function sectionize(entries2, parentLevel = 0) {
+  const children = [];
+  for (let index = 0;index < entries2.length; ) {
+    const entry = entries2[index];
+    if (!entry?.templateHeading) {
+      children.push(entry);
+      index += 1;
+      continue;
+    }
+    const { level, title, id } = entry;
+    if (level > parentLevel + 1)
+      throw new Error(`Heading h${level}: skips a section level after h${parentLevel}:`);
+    index += 1;
+    const body = [];
+    while (index < entries2.length) {
+      const following = entries2[index];
+      if (following?.templateHeading && following.level <= level)
+        break;
+      body.push(following);
+      index += 1;
+    }
+    children.push(createSection([outputMap({ level: new Integer(BigInt(level)), title, children: sectionize(body, level), id: id ? literalValue2(id) : null })]));
+  }
+  return children;
+}
+
+class DocumentTemplateParser {
+  constructor(source, context, evaluate) {
+    this.lines = source.split(`
+`);
+    this.context = context;
+    this.evaluate = evaluate;
+  }
+  indentation(line) {
+    if (/\t/.test(line))
+      throw new Error("Tabs are not allowed for document-template indentation");
+    return (line.match(/^ */) || [""])[0].length;
+  }
+  bodyEnd(index, indent, end) {
+    let cursor = index + 1;
+    while (cursor < end) {
+      if (!this.lines[cursor].trim()) {
+        let probe = cursor + 1;
+        while (probe < end && !this.lines[probe].trim())
+          probe += 1;
+        if (probe >= end || this.indentation(this.lines[probe]) <= indent)
+          break;
+        cursor = probe;
+        continue;
+      }
+      if (this.indentation(this.lines[cursor]) <= indent)
+        break;
+      cursor += 1;
+    }
+    return cursor;
+  }
+  bodyLines(index, end, indent) {
+    return this.lines.slice(index, end).map((line) => {
+      if (!line.trim())
+        return "";
+      const actual = this.indentation(line);
+      if (actual < indent + 4)
+        throw new Error("Document-template bodies must be indented by four spaces");
+      return line.slice(indent + 4);
+    });
+  }
+  parseBlocks(start = 0, end = this.lines.length, indent = 0) {
+    const blocks = [];
+    for (let index = start;index < end; ) {
+      const line = this.lines[index];
+      if (!line.trim()) {
+        index += 1;
+        continue;
+      }
+      if (this.indentation(line) !== indent)
+        throw new Error("Unexpected document-template indentation");
+      const source = line.slice(indent);
+      const standalone = standaloneInterpolation(source, this.context, this.evaluate);
+      if (standalone.matched) {
+        blocks.push(isOutputValue(standalone.value) ? standalone.value : createParagraph([[textValue(formatValue(standalone.value, { context: this.context, evaluate: this.evaluate }))]]));
+        index += 1;
+        continue;
+      }
+      const directive = source.match(/^([a-z][\w-]*):(?:\s*(.*))?$/i);
+      const name = directive?.[1].toLowerCase();
+      const supported = new Set(["p", "fig", "figure", "table", "quote", "callout", "code", "math", "ul", "ol", "section", "asset", "image", "audio", "video"]);
+      const heading = source.match(/^h([1-6]):\s*(.*)$/i);
+      if (heading) {
+        const header = headerLabel(heading[2]);
+        blocks.push({ templateHeading: true, level: Number(heading[1]), title: inlineText(header.text, this.context, this.evaluate), id: header.id });
+        index += 1;
+        continue;
+      }
+      if (directive && supported.has(name)) {
+        const bodyEnd = this.bodyEnd(index, indent, end);
+        const body = this.bodyLines(index + 1, bodyEnd, indent);
+        blocks.push(this.directive(name, directive[2] || "", body, indent));
+        index = bodyEnd;
+        continue;
+      }
+      const paragraph = [source];
+      index += 1;
+      while (index < end && this.lines[index].trim() && this.indentation(this.lines[index]) === indent) {
+        const candidate = this.lines[index].slice(indent);
+        if (/^(?:h[1-6]|p|fig|figure|table|quote|callout|code|math|ul|ol|section|asset|image|audio|video):/i.test(candidate) || standaloneInterpolation(candidate, this.context, this.evaluate).matched)
+          break;
+        paragraph.push(candidate);
+        index += 1;
+      }
+      blocks.push(createParagraph([inlineText(paragraph.join(`
+`), this.context, this.evaluate)]));
+    }
+    return sectionize(blocks);
+  }
+  directive(name, header, body, indent) {
+    const bodySource = body.join(`
+`);
+    const nested = () => new DocumentTemplateParser(bodySource, this.context, this.evaluate).parseBlocks();
+    if (name === "p")
+      return createParagraph([inlineText([header, bodySource].filter(Boolean).join(bodySource ? `
+` : ""), this.context, this.evaluate)]);
+    if (name === "code")
+      return createCodeBlock([outputMap({ code: literalValue2(interpolatedLiteral(bodySource, this.context, this.evaluate, { output: "reject" })), language: literalValue2(header || "text") })]);
+    if (name === "math")
+      return createMathBlock([outputMap({ source: literalValue2(interpolatedLiteral(bodySource || header, this.context, this.evaluate, { output: "reject" })) })]);
+    if (name === "quote")
+      return createQuote([outputMap({ children: nested(), attribution: header ? inlineText(header, this.context, this.evaluate) : null })]);
+    if (name === "callout") {
+      const match = header.match(/^(note|tip|warning|caution|important)(?:\s+—\s*(.*))?$/i);
+      if (!match)
+        throw new Error("Callout header must be VARIANT or VARIANT — TITLE");
+      return createCallout([outputMap({ variant: literalValue2(match[1]), title: match[2] ? inlineText(match[2], this.context, this.evaluate) : null, children: nested() })]);
+    }
+    if (name === "ul" || name === "ol")
+      return this.list(body, name === "ol");
+    if (name === "section") {
+      const match = header.match(/^([1-6])\s+(.+)$/);
+      if (!match)
+        throw new Error("Section header must be LEVEL TITLE");
+      const sectionHeader = headerLabel(match[2]);
+      return createSection([outputMap({ level: new Integer(BigInt(match[1])), title: inlineText(sectionHeader.text, this.context, this.evaluate), children: nested(), id: sectionHeader.id ? literalValue2(sectionHeader.id) : null })]);
+    }
+    if (["asset", "image", "audio", "video"].includes(name)) {
+      const descriptor = parseAssetDescriptor(`${name}: ${header}`, this.context, this.evaluate);
+      if (name === "asset") {
+        if (!descriptor.attributes.mime)
+          throw new Error("asset: requires a mime attribute");
+        return createAsset([outputMap({
+          ref: literalValue2(descriptor.primary),
+          mime: literalValue2(descriptor.attributes.mime),
+          width: descriptor.attributes.width,
+          height: descriptor.attributes.height,
+          filename: descriptor.attributes.filename ? literalValue2(descriptor.attributes.filename) : null
+        })]);
+      }
+      return mediaOutput(name, descriptor, descriptor.attributes.alt || "", this.context, this.evaluate);
+    }
+    if (["fig", "figure", "table"].includes(name)) {
+      const label = headerLabel(header);
+      const standalone = standaloneInterpolation(bodySource, this.context, this.evaluate);
+      const content = standalone.matched ? standalone.value : createParagraph([inlineText(bodySource, this.context, this.evaluate)]);
+      return createFigure([content, label.text ? literalValue2(inlinePlainText(label.text, this.context, this.evaluate)) : null, label.id ? literalValue2(label.id) : null]);
+    }
+    throw new Error(`Unsupported document-template directive: ${name}`);
+  }
+  list(lines, ordered) {
+    const items = [];
+    for (let index = 0;index < lines.length; ) {
+      if (!lines[index].trim()) {
+        index += 1;
+        continue;
+      }
+      if (!lines[index].startsWith("- "))
+        throw new Error("List bodies require '- ' item markers");
+      const first = lines[index].slice(2);
+      index += 1;
+      const child = [];
+      while (index < lines.length && (!lines[index].trim() || lines[index].startsWith("    "))) {
+        child.push(lines[index].trim() ? lines[index].slice(4) : "");
+        index += 1;
+      }
+      const children = [createParagraph([inlineText(first, this.context, this.evaluate)])];
+      if (child.some((line) => line.trim()))
+        children.push(...new DocumentTemplateParser(child.join(`
+`), this.context, this.evaluate).parseBlocks());
+      items.push(createListItem([children]));
+    }
+    return createList([[...items], ordered ? new Integer(1n) : new Integer(0n)]);
+  }
+}
 function documentTemplate(body, context, evaluate) {
-  const normalized = body.replace(/^\s*\n/, "").replace(/\n\s*$/, "");
+  const trimmed = body.replace(/^\s*\n/, "").replace(/\n\s*$/, "");
+  const indents = trimmed.split(`
+`).filter((line) => line.trim()).map((line) => (line.match(/^ */) || [""])[0].length);
+  const commonIndent = indents.length ? Math.min(...indents) : 0;
+  const normalized = trimmed.split(`
+`).map((line) => line.trim() ? line.slice(commonIndent) : "").join(`
+`);
   if (!normalized.trim())
     return createFragment([[]]);
-  const children = normalized.split(/\n\s*\n/).map((block) => {
-    const source = block.trim();
-    const standalone = standaloneInterpolation(source, context, evaluate);
-    if (standalone !== null)
-      return standalone;
-    const heading = source.match(/^h([1-6]):\s*([\s\S]*)$/i);
-    if (heading)
-      return createHeading([new Integer(BigInt(heading[1])), textValue(interpolateText(heading[2], context, evaluate))]);
-    const directive = source.match(/^(fig|figure|table):\s*([^\n]*)(?:\n([\s\S]*))?$/i);
-    if (directive) {
-      const [, kind, captionSource, contentSource = ""] = directive;
-      const content = standaloneInterpolation(contentSource.trim(), context, evaluate) ?? createParagraph([[textValue(interpolateText(contentSource.trim(), context, evaluate))]]);
-      const caption = captionSource.replace(/\s+#[-\w:.]+\s*$/, "").trim();
-      const label = (captionSource.match(/\s+(#[-\w:.]+)\s*$/) || [])[1]?.slice(1) || null;
-      return createFigure([content, caption ? textValue(interpolateText(caption, context, evaluate)) : null, label ? textValue(label) : null]);
-    }
-    const paragraph = source.match(/^p:\s*([\s\S]*)$/i);
-    return createParagraph([[textValue(interpolateText(paragraph ? paragraph[1] : source, context, evaluate))]]);
-  });
-  return createFragment([children]);
+  return createFragment([new DocumentTemplateParser(normalized, context, evaluate).parseBlocks()]);
 }
 var templateText = {
   lazy: true,
   pure: false,
   doc: "Create interpolated text with @{expression} insertions",
-  impl: (args, context, evaluate) => textValue(interpolateText(args[0], context, evaluate))
+  impl: (args, context, evaluate) => textValue(interpolatedLiteral(args[0], context, evaluate))
 };
 var documentTemplateFunction = {
   lazy: true,
@@ -28918,13 +30001,39 @@ var liveViewFunction = {
     return createLiveView(source, derive);
   }
 };
+var outFunction = {
+  pure: false,
+  doc: "Declare an output artifact for the active host output sink",
+  impl(args, context) {
+    if (args.length !== 2)
+      throw new Error(".Out expects a relative output path and a value");
+    const [target, value] = args;
+    if (!target || target.type !== "string" || !target.value.trim()) {
+      throw new Error(".Out output path must be a non-empty string");
+    }
+    const sink = context.getEnv("__output_sink__", null);
+    if (typeof sink !== "function") {
+      throw new Error(".Out requires a host output sink (use rix --out=DIR)");
+    }
+    sink({ path: target.value, value });
+    return value;
+  }
+};
 var outputFunctions = {
+  OUT: outFunction,
   BIND: bindFunction,
   LIVEVIEW: liveViewFunction,
   TEXT: capability(createText, "Create a portable text output node"),
   PARAGRAPH: capability(createParagraph, "Create a portable paragraph output node"),
   HEADING: capability(createHeading, "Create a portable document heading"),
   FRAGMENT: capability(createFragment, "Compose portable output values"),
+  SNAPSHOTS: {
+    pure: true,
+    doc: "Materialize [scene, states] tuples into a portable ordered snapshot list",
+    impl(args, context, evaluate) {
+      return createSnapshots(args, { context, evaluate, invoke: callWithConcreteArgs });
+    }
+  },
   EMPHASIS: capability(createEmphasis, "Create semantic inline emphasis"),
   STRONG: capability(createStrong, "Create semantic inline strong content"),
   CODE: capability(createCode, "Create literal inline code"),
@@ -30729,7 +31838,7 @@ var BUNDLED_PLUGINS = [
       kind: "host",
       mount: "draw",
       exports: ["Line", "Polygon", "Label", "Box", "Circle"],
-      groups: ["Draw"],
+      groups: ["Draw", "Renderers"],
       permissions: [],
       defaultEnabled: false
     },
@@ -30742,7 +31851,7 @@ var BUNDLED_PLUGINS = [
       kind: "host",
       mount: "plot",
       exports: ["Polynomial"],
-      groups: ["Plot"],
+      groups: ["Plot", "Renderers"],
       permissions: [],
       defaultEnabled: false
     },
@@ -31034,6 +32143,65 @@ function installUnitExactVariants(registry) {
 }
 
 // ../../rix/src/eval/evaluator.js
+var POSTFIX_CHECK_VALUE_ENV = "__postfix_check_value__";
+function formatCheckValue(value) {
+  try {
+    return formatValue(value);
+  } catch (_error) {
+    return String(value);
+  }
+}
+function withPostfixCheckValue(context, value, callback) {
+  const hadPrevious = context.env?.has(POSTFIX_CHECK_VALUE_ENV) === true;
+  const previous = context.getEnv(POSTFIX_CHECK_VALUE_ENV, undefined);
+  context.setEnv(POSTFIX_CHECK_VALUE_ENV, value);
+  try {
+    return callback();
+  } finally {
+    if (hadPrevious)
+      context.setEnv(POSTFIX_CHECK_VALUE_ENV, previous);
+    else
+      context.env?.delete(POSTFIX_CHECK_VALUE_ENV);
+  }
+}
+function checkPostfixType(value, spec2, context, registry, evaluateValue) {
+  const name = String(spec2?.name || "").toLowerCase();
+  const structuralKinds = { array: "sequence", set: "set", map: "map", tuple: "tuple", tensor: "tensor" };
+  const expectedType = spec2?.semantic ? null : structuralKinds[name];
+  if (!expectedType) {
+    if (!spec2?.semantic && name === "number") {
+      const constructor2 = value?.constructor?.name;
+      if (typeof value === "number" || ["Integer", "Rational", "RationalInterval"].includes(constructor2))
+        return;
+    }
+    const semantic = registry.get("SEMANTIC_HAS");
+    const passed = semantic?.impl([value, name], context, evaluateValue);
+    if (passed === null || passed === undefined) {
+      throw new Error(`##: check failed: expected semantic membership :${name}, received ${formatCheckValue(value)}`);
+    }
+    return;
+  }
+  if (value === null || value === undefined || value.type !== expectedType) {
+    throw new Error(`##: check failed: expected ${name}, received ${formatCheckValue(value)}`);
+  }
+  const shape = spec2?.shape;
+  if (!shape)
+    return;
+  if (name === "tensor") {
+    const actual = Array.from(value.shape || []);
+    if (actual.length !== shape.length || actual.some((dimension, index) => dimension !== shape[index])) {
+      throw new Error(`##: check failed: expected tensor[${shape.join("x")}], received tensor[${actual.join("x")}]`);
+    }
+    return;
+  }
+  if (shape.length !== 1) {
+    throw new Error(`##: check failed: ${name} accepts one size, not [${shape.join("x")}]`);
+  }
+  const count = name === "map" ? value.entries?.size : value.values?.length;
+  if (count !== shape[0]) {
+    throw new Error(`##: check failed: expected ${name}[${shape[0]}], received ${name}[${count ?? "?"}]`);
+  }
+}
 function createDefaultRegistry(options = {}) {
   registerBuiltinSemanticTypes();
   const registry = new Registry;
@@ -31168,6 +32336,7 @@ function defineCapability(args, _context, evaluate) {
 }
 var SCRIPT_RUNTIME_ENV_KEY = "__script_runtime__";
 var SOURCE_ENV_KEY = "__source__";
+var CUSTOM_OPERATOR_ENV_KEY2 = "__custom_operator_definitions__";
 var CURRENT_FILE_ENV_KEY = "__current_file__";
 function createDefaultSystemContext(options = {}) {
   const frozen = options.frozen !== false;
@@ -31184,6 +32353,8 @@ function createDefaultSystemContext(options = {}) {
   ctx.registerValue("Graphics", graphics, { doc: "Intrinsic portable 2D scene language" });
   const controls = createControlsOutputCollection();
   ctx.registerValue("Controls", controls, { doc: "Reactive control constructors" });
+  const timeline = createTimelineOutputCollection();
+  ctx.registerValue("Timeline", timeline, { doc: "Portable exact timeline constructors" });
   ctx.registerAll(stdlibFunctions);
   ctx.registerAll(symbolicCapabilities);
   ctx.registerCallableValue("Poly", createPolySystemValue(), symbolicCapabilities.POLY, {
@@ -31266,7 +32437,8 @@ function getScriptRuntime(context, options = {}) {
       systemLookup: options.systemLookup || defaultSystemLookup,
       preparedScripts: new Map,
       activeImports: [],
-      frameStack: []
+      frameStack: [],
+      operatorDefinitions: context.getEnv(CUSTOM_OPERATOR_ENV_KEY2, new Map)
     };
     context.setEnv(SCRIPT_RUNTIME_ENV_KEY, runtime);
     return runtime;
@@ -31274,6 +32446,7 @@ function getScriptRuntime(context, options = {}) {
   if (!runtime.systemLookup) {
     runtime.systemLookup = options.systemLookup || defaultSystemLookup;
   }
+  runtime.operatorDefinitions = context.getEnv(CUSTOM_OPERATOR_ENV_KEY2, runtime.operatorDefinitions || new Map);
   return runtime;
 }
 function getScriptCapabilityConfig(context, systemContext = null) {
@@ -31387,7 +32560,10 @@ function prepareScript(resolvedPath, runtime) {
   } catch (error) {
     throw new Error(`Unable to load script '${resolvedPath}': ${error.message}`);
   }
-  const ast = parse(source, runtime.systemLookup || defaultSystemLookup);
+  const ast = parse(source, runtime.systemLookup || defaultSystemLookup, {
+    operatorDefinitions: runtime.operatorDefinitions,
+    file: resolvedPath
+  });
   const { inputContract, exportBindings, body } = extractScriptInterface(ast, resolvedPath);
   const bodyIr = lower(body);
   attachSourceInfo(bodyIr, source, resolvedPath);
@@ -31687,6 +32863,22 @@ function evaluate(irNode, context, registry, systemContext) {
       return evaluateScriptImport(args[0] || {}, context, registry, systemContext);
     }
     const evalFn = (node) => evaluate(node, context, registry, systemContext);
+    if (fn === "POSTFIX_CHECK_VALUE") {
+      return context.getEnv(POSTFIX_CHECK_VALUE_ENV, null);
+    }
+    if (fn === "POSTFIX_PREDICATE_CHECK") {
+      const value = evalFn(args[0]);
+      const passed = withPostfixCheckValue(context, value, () => evalFn(args[1]));
+      if (passed === null || passed === undefined) {
+        throw new Error(`##@ check failed for ${formatCheckValue(value)}`);
+      }
+      return value;
+    }
+    if (fn === "POSTFIX_TYPE_CHECK") {
+      const value = evalFn(args[0]);
+      checkPostfixType(value, args[1], context, registry, evalFn);
+      return value;
+    }
     if (fn === "SYS_OBJ") {
       if (!systemContext)
         throw new Error("No system context available");
@@ -31800,9 +32992,10 @@ function parseAndEvaluate(code, options = {}) {
   const systemContext = options.systemContext || createDefaultSystemContext();
   context.setEnv("__system_context__", systemContext);
   const systemLookup = createSystemLookup(systemContext, options.systemLookup || defaultSystemLookup);
-  getScriptRuntime(context, { systemLookup });
+  const runtime = getScriptRuntime(context, { systemLookup });
+  runtime.operatorDefinitions = mergeOperatorDefinitions(context.getEnv(CUSTOM_OPERATOR_ENV_KEY2, new Map), options.operatorDefinitions);
   context.setEnv("__registry__", registry);
-  context.setEnv("__plugin_load_rix__", ({ source, sourcePath, context: pluginContext = context, registry: pluginRegistry = registry, systemContext: pluginSystemContext = systemContext }) => {
+  context.setEnv("__plugin_load_rix__", ({ source, sourcePath, metadata, options: pluginOptions, operatorDefinitions, context: pluginContext = context, registry: pluginRegistry = registry, systemContext: pluginSystemContext = systemContext }) => {
     const previousSource = pluginContext.getEnv(SOURCE_ENV_KEY, undefined);
     const previousFile = pluginContext.getEnv(CURRENT_FILE_ENV_KEY, undefined);
     try {
@@ -31810,7 +33003,12 @@ function parseAndEvaluate(code, options = {}) {
         context: pluginContext,
         registry: pluginRegistry,
         systemContext: pluginSystemContext,
-        file: sourcePath
+        file: sourcePath,
+        operatorDefinitions,
+        operatorOwner: metadata?.id ? {
+          pluginId: metadata.id,
+          mount: pluginOptions?.as || metadata.mount || null
+        } : null
       });
     } finally {
       pluginContext.setEnv(SOURCE_ENV_KEY, previousSource);
@@ -31821,7 +33019,11 @@ function parseAndEvaluate(code, options = {}) {
     context.setEnv("randomFunction", options.rng);
   context.setEnv(SOURCE_ENV_KEY, code);
   context.setEnv(CURRENT_FILE_ENV_KEY, options.file || "<repl>");
-  const ast = parse(code, systemLookup);
+  const ast = parse(code, systemLookup, {
+    operatorDefinitions: runtime.operatorDefinitions,
+    operatorOwner: options.operatorOwner || null,
+    file: options.file || "<repl>"
+  });
   const irNodes = lower(ast);
   attachSourceInfo(irNodes, code, options.file || "<repl>");
   let result = null;
@@ -32637,6 +33839,8 @@ function controlValue(control, event) {
     return rangeValue(control, event.indices);
   if (control.kind === "control_reset")
     return control.initial;
+  if (control.kind === "control_action")
+    return control.run();
   if (control.kind === "control_input") {
     if (!("value" in event))
       throw new Error("Control input requires an evaluated RiX value");
@@ -32731,10 +33935,10 @@ class ControlPanelWidgetSession {
       }));
       return commitControlEdits(edits);
     }
-    if (event?.type !== "control:set") {
+    if (event?.type !== "control:set" && event?.type !== "control:action") {
       throw new Error(`Unsupported ControlPanel widget event: ${event?.type || "missing type"}`);
     }
-    const edit = resolveControlEdit(this.controls, event);
+    const edit = resolveControlEdit(this.controls, { ...event, type: "control:set" });
     const { control, value, replacedDependencies } = edit;
     control.target.replaceValue(value, {
       source: "widget",
@@ -33103,6 +34307,14 @@ function enhancePanel(panel, options) {
       }));
       continue;
     }
+    if (kind === "action") {
+      input.addEventListener("click", () => commit({
+        ...identity(),
+        type: "control:action",
+        source: "action"
+      }));
+      continue;
+    }
     if (kind === "choice") {
       input.addEventListener("change", () => commit({
         ...identity(),
@@ -33201,6 +34413,10 @@ function childOutputs(value) {
     return [];
   if (value.kind === "fragment")
     return value.children;
+  if (value.kind === "snapshots")
+    return value.snapshots.map((snapshot) => snapshot.content);
+  if (value.kind === "timeline_render")
+    return [value.content];
   if (value.kind === "figure" || value.kind === "slide")
     return [value.content];
   if (value.kind === "slides")
@@ -33781,5 +34997,5 @@ try {
   setStatus("Local recovery failed; opened a new document");
 }
 
-//# debugId=064A079A9222B44B64756E2164756E21
+//# debugId=98ECEF5BD2E5DA2264756E2164756E21
 //# sourceMappingURL=main.js.map
