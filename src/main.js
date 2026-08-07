@@ -2,21 +2,16 @@ import {
     appendRixCelEvent,
     clearRixCelDraft,
     createRixCelDocument,
-    formatValue,
-    mountOutputWidgets,
-    parseAndEvaluate,
+    enhanceSheetViews,
     parseRixCelDocument,
-    renderOutputHtml,
     setRixCelCursor,
     setRixCelDraft,
     stringifyRixCelDocument,
 } from "../../../rix/src/index.js";
-import { createRixCelEvaluationState } from "./evaluation-runtime.js";
 import { RixCelWorkerClient } from "./evaluation-worker-client.js";
 
 const STORAGE_KEY = "rixcel.autosave.v2";
 const LEGACY_STORAGE_KEY = "rixcel.autosave.v1";
-const state = createRixCelEvaluationState();
 const evaluationWorker = new RixCelWorkerClient({ timeoutMs: 2000 });
 const host = document.querySelector("#sheet-host");
 const fileInput = document.querySelector("#file-input");
@@ -25,33 +20,19 @@ const documentName = document.querySelector("#document-name");
 const headerToggle = document.querySelector('[data-field="header"]');
 const undoButton = document.querySelector('[data-action="undo"]');
 const redoButton = document.querySelector('[data-action="redo"]');
+const previousRowsButton = document.querySelector('[data-action="previous-rows"]');
+const nextRowsButton = document.querySelector('[data-action="next-rows"]');
+const previousColumnsButton = document.querySelector('[data-action="previous-columns"]');
+const nextColumnsButton = document.querySelector('[data-action="next-columns"]');
+const windowStatus = document.querySelector("#window-status");
 const switchDialog = document.querySelector("#switch-document-dialog");
 
-let model = null;
 let documentLog = null;
+let projection = null;
 let name = "Untitled.rixcel";
-let disposeWidgets = null;
-let unsubscribe = null;
-let restoring = false;
 let dirty = false;
 let sessionFloorCursor = 0;
-
-function evaluate(source) {
-    return parseAndEvaluate(source, { ...state, file: "<rixcel>" });
-}
-
-function setHostText(text) {
-    state.context.setFresh("hosttext", { type: "string", value: text });
-}
-
-function importDocumentMain(document) {
-    setHostText(stringifyRixCelDocument(document));
-    return evaluate(".RiXCelImport(hosttext)");
-}
-
-function exactFormat(value) {
-    return formatValue(value, { context: state.context, evaluate: null });
-}
+const viewport = { rowStart: 1, rowCount: 40, columnStart: 1, columnCount: 12 };
 
 function setStatus(message) {
     status.textContent = message;
@@ -60,6 +41,17 @@ function setStatus(message) {
 function updateHistoryButtons() {
     undoButton.disabled = !documentLog || documentLog.cursor <= sessionFloorCursor;
     redoButton.disabled = !documentLog || documentLog.cursor >= documentLog.events.length;
+}
+
+function updateWindowControls() {
+    if (!projection) return;
+    const { rowStart, rowCount, columnStart, columnCount } = projection.window;
+    const [rowTotal, columnTotal = 1] = projection.shape;
+    previousRowsButton.disabled = rowStart <= 1;
+    nextRowsButton.disabled = rowStart + rowCount > rowTotal;
+    previousColumnsButton.disabled = columnStart <= 1;
+    nextColumnsButton.disabled = columnStart + columnCount > columnTotal;
+    windowStatus.textContent = `Rows ${rowStart}–${rowStart + rowCount - 1} of ${rowTotal} · Columns ${columnStart}–${columnStart + columnCount - 1} of ${columnTotal}`;
 }
 
 function persistRecovery() {
@@ -73,85 +65,6 @@ function persistRecovery() {
     } catch (error) {
         setStatus(`Local recovery unavailable: ${error.message || String(error)}`);
     }
-}
-
-function slotEventFromFormula(event) {
-    const cause = event.cause || {};
-    if (cause.type !== "formula:set" || !Array.isArray(cause.index) || typeof cause.source !== "string") {
-        return null;
-    }
-    return {
-        type: "slot:set",
-        index: [...cause.index],
-        source: cause.source,
-        assignmentMode: cause.assignmentMode || ":=",
-        view: {},
-    };
-}
-
-function batchEventFromFormula(event) {
-    const cause = event.cause || {};
-    if (cause.type !== "formula:batch" || !Array.isArray(cause.edits) || cause.edits.length === 0) return null;
-    return {
-        type: "slot:batch",
-        edits: cause.edits.map((edit) => ({
-            index: [...edit.index],
-            source: edit.source,
-            assignmentMode: edit.assignmentMode || ":=",
-            view: edit.view || {},
-        })),
-    };
-}
-
-function draftFromFormulaError(event) {
-    const cause = event.cause || {};
-    if (!Array.isArray(cause.index) || typeof cause.source !== "string") return null;
-    const message = event.error?.message || String(event.error || "Formula edit did not commit");
-    return {
-        index: [...cause.index],
-        source: cause.source,
-        assignmentMode: cause.assignmentMode || ":=",
-        kind: cause.type === "formula:parse" ? "parse" : /cycle/iu.test(message) ? "cycle" : "runtime",
-        message,
-    };
-}
-
-function recordCommittedEvent(event) {
-    if (restoring || !documentLog) return;
-    if (event.type === "formula:commit") {
-        const batch = batchEventFromFormula(event);
-        if (batch) {
-            let next = documentLog;
-            for (const edit of batch.edits) next = clearRixCelDraft(next, edit.index);
-            documentLog = appendRixCelEvent(next, batch);
-            dirty = true;
-            setStatus(`Saved ${batch.edits.length} cells locally · event ${documentLog.cursor} · epoch ${model.epoch}`);
-            updateHistoryButtons();
-            persistRecovery();
-            return;
-        }
-        const edit = slotEventFromFormula(event);
-        if (!edit) return;
-        documentLog = appendRixCelEvent(clearRixCelDraft(documentLog, edit.index), edit);
-        dirty = true;
-        setStatus(`Saved locally · event ${documentLog.cursor} · epoch ${model.epoch}`);
-    } else if (event.type === "formula:view" && event.cause?.type === "view:axis-label") {
-        documentLog = appendRixCelEvent(documentLog, {
-            type: "view:axis-label",
-            axis: event.cause.axis,
-            coordinate: event.cause.coordinate,
-            label: event.cause.label,
-        });
-        dirty = true;
-        setStatus(`Saved label locally · event ${documentLog.cursor}`);
-    } else if (event.type === "formula:error") {
-        const draft = draftFromFormulaError(event);
-        if (draft) documentLog = setRixCelDraft(documentLog, draft);
-        dirty = true;
-        setStatus(event.error?.message || "Formula error");
-    }
-    updateHistoryButtons();
-    persistRecovery();
 }
 
 function decorateDrafts() {
@@ -169,91 +82,121 @@ function decorateDrafts() {
     }
 }
 
-async function preflightEdit(detail) {
-    const edit = {
-        type: "slot:set",
-        index: [...detail.index],
-        source: detail.source,
-        assignmentMode: detail.assignmentMode || ":=",
-        view: {},
-    };
-    const candidate = appendRixCelEvent(clearRixCelDraft(documentLog, edit.index), edit);
-    try {
-        await evaluationWorker.request({ type: "validate", document: candidate });
-    } catch (error) {
-        documentLog = setRixCelDraft(documentLog, {
-            index: edit.index,
-            source: edit.source,
-            assignmentMode: edit.assignmentMode,
-            kind: /compile|parse|token|unexpected/iu.test(error.message) ? "parse" : /cycle/iu.test(error.message) ? "cycle" : "runtime",
-            message: error.message,
-        });
-        dirty = true;
-        persistRecovery();
-        decorateDrafts();
-        throw error;
-    }
+function errorKind(message) {
+    return /compile|parse|token|unexpected/iu.test(message)
+        ? "parse"
+        : /cycle/iu.test(message)
+            ? "cycle"
+            : "runtime";
 }
 
-async function preflightBatchEdit(detail) {
-    const event = {
-        type: "slot:batch",
-        edits: detail.edits.map((edit) => ({
-            index: [...edit.index],
-            source: edit.source,
-            assignmentMode: edit.assignmentMode || ":=",
-            view: {},
-        })),
-    };
-    let next = documentLog;
-    for (const edit of event.edits) next = clearRixCelDraft(next, edit.index);
-    const candidate = appendRixCelEvent(next, event);
-    await evaluationWorker.request({ type: "validate", document: candidate });
-}
-
-function render() {
-    disposeWidgets?.();
-    const view = evaluate('.Sheet(document, {= title="RiXCel document" })');
-    host.innerHTML = renderOutputHtml(view, exactFormat);
-    disposeWidgets = mountOutputWidgets(host, view, {
-        format: exactFormat,
-        beforeSheetEdit: preflightEdit,
-        beforeSheetBatchEdit: preflightBatchEdit,
+function renderProjection(nextProjection) {
+    projection = nextProjection;
+    Object.assign(viewport, nextProjection.window);
+    host.innerHTML = nextProjection.html;
+    enhanceSheetViews(host, {
         onSelection(detail) {
             setStatus(detail.coordinateLabel || detail.address);
         },
+        async onEdit(detail) {
+            const event = {
+                type: "slot:set",
+                index: [...detail.index],
+                source: detail.source,
+                assignmentMode: detail.assignmentMode || ":=",
+                view: {},
+            };
+            try {
+                const result = await commitEvent(event);
+                setTimeout(() => renderProjection(result), 0);
+                return { type: "result", text: detail.source, revision: result.epoch };
+            } catch (error) {
+                documentLog = setRixCelDraft(documentLog, {
+                    index: event.index,
+                    source: event.source,
+                    assignmentMode: event.assignmentMode,
+                    kind: errorKind(error.message),
+                    message: error.message,
+                });
+                dirty = true;
+                persistRecovery();
+                decorateDrafts();
+                return { type: "error", text: error.message };
+            }
+        },
+        async onBatchEdit(detail) {
+            const event = {
+                type: "slot:batch",
+                edits: detail.edits.map((edit) => ({
+                    index: [...edit.index],
+                    source: edit.source,
+                    assignmentMode: edit.assignmentMode || ":=",
+                    view: {},
+                })),
+            };
+            try {
+                const result = await commitEvent(event);
+                setTimeout(() => renderProjection(result), 0);
+                return { type: "result", revision: result.epoch };
+            } catch (error) {
+                setStatus(error.message);
+                return { type: "error", text: error.message };
+            }
+        },
+        onHeaderEdit(detail) {
+            commitEvent({
+                type: "view:axis-label",
+                axis: detail.axis,
+                coordinate: detail.coordinate,
+                label: detail.label || null,
+            }).then((result) => renderProjection(result)).catch((error) => setStatus(error.message));
+            return { type: "result" };
+        },
     });
     decorateDrafts();
+    updateHistoryButtons();
+    updateWindowControls();
 }
 
-function bindModel(next, nextName, nextDocument, { resetSession = true } = {}) {
-    unsubscribe?.();
-    model = next;
-    documentLog = parseRixCelDocument(nextDocument);
+async function commitEvent(event) {
+    let next = documentLog;
+    const edits = event.type === "slot:batch" ? event.edits : event.type === "slot:set" ? [event] : [];
+    for (const edit of edits) next = clearRixCelDraft(next, edit.index);
+    const candidate = appendRixCelEvent(next, event);
+    const result = await evaluationWorker.request({ type: "commit", document: candidate, window: viewport });
+    documentLog = candidate;
+    dirty = true;
+    persistRecovery();
+    setStatus(event.type === "slot:batch"
+        ? `Saved ${event.edits.length} cells locally · event ${documentLog.cursor} · epoch ${result.epoch}`
+        : `Saved locally · event ${documentLog.cursor} · epoch ${result.epoch}`);
+    return result;
+}
+
+function bindProjection(result, nextName, { resetSession = true } = {}) {
+    documentLog = parseRixCelDocument(result.document);
     name = nextName || "Untitled.rixcel";
     documentName.textContent = name;
-    state.context.setFresh("document", model);
     if (resetSession) sessionFloorCursor = documentLog.cursor;
-    unsubscribe = model.subscribe(recordCommittedEvent);
-    render();
-    updateHistoryButtons();
+    renderProjection(result);
     persistRecovery();
 }
 
 async function loadDocument(document, nextName, options = {}) {
     const canonical = parseRixCelDocument(document);
-    await evaluationWorker.request({ type: "validate", document: canonical });
-    bindModel(importDocumentMain(canonical), nextName, canonical, options);
+    const result = await evaluationWorker.request({ type: "open", document: canonical, window: viewport });
+    bindProjection(result, nextName, options);
 }
 
 async function importText(text, kind, nextName) {
     const header = headerToggle.checked;
     const id = (nextName || "imported").replace(/\.[^.]+$/u, "") || "imported";
-    const result = await evaluationWorker.request({ type: "import", kind, text, header, id });
-    bindModel(importDocumentMain(result.document), nextName, result.document);
+    const result = await evaluationWorker.request({ type: "import", kind, text, header, id, window: viewport });
+    bindProjection(result, nextName);
 }
 
 async function newDocument() {
+    Object.assign(viewport, { rowStart: 1, columnStart: 1 });
     const document = createRixCelDocument({
         id: "untitled",
         shape: [20, 8],
@@ -281,11 +224,10 @@ function saveDocument() {
     setStatus(`Saved document with ${documentLog.events.length} history events`);
 }
 
-function exportDelimited(kind) {
-    const fn = kind === "csv" ? ".RiXCelExportCsv" : ".RiXCelExportTsv";
-    const result = evaluate(`${fn}(document)`);
+async function exportDelimited(kind) {
+    const result = await evaluationWorker.request({ type: "export", kind });
     const base = name.replace(/\.rixcel$/iu, "") || "sheet";
-    download(result.value, `${base}.${kind}`, kind === "csv" ? "text/csv" : "text/tab-separated-values");
+    download(result.text, `${base}.${kind}`, kind === "csv" ? "text/csv" : "text/tab-separated-values");
     setStatus(`Exported ${kind.toUpperCase()}`);
 }
 
@@ -293,6 +235,7 @@ async function openFile(file) {
     const text = await file.text();
     const extension = file.name.split(".").at(-1)?.toLowerCase();
     const kind = extension === "rixcel" ? "rixcel" : extension === "tsv" ? "tsv" : "csv";
+    Object.assign(viewport, { rowStart: 1, columnStart: 1 });
     await importText(text, kind, kind === "rixcel" ? file.name : `${file.name.replace(/\.[^.]+$/u, "")}.rixcel`);
     dirty = false;
     persistRecovery();
@@ -302,15 +245,16 @@ async function openFile(file) {
 async function restoreCursor(cursor) {
     if (!documentLog || cursor < sessionFloorCursor || cursor > documentLog.events.length) return;
     const candidate = setRixCelCursor(documentLog, cursor);
-    restoring = true;
-    try {
-        await evaluationWorker.request({ type: "validate", document: candidate });
-        bindModel(importDocumentMain(candidate), name, candidate, { resetSession: false });
-        dirty = true;
-        setStatus(cursor < documentLog.events.length ? "Undo restored" : "Redo restored");
-    } finally {
-        restoring = false;
-    }
+    const result = await evaluationWorker.request({ type: "open", document: candidate, window: viewport });
+    bindProjection(result, name, { resetSession: false });
+    dirty = true;
+    setStatus(cursor < documentLog.events.length ? "Undo restored" : "Redo restored");
+}
+
+async function moveWindow(rowDelta, columnDelta) {
+    viewport.rowStart = Math.max(1, viewport.rowStart + rowDelta);
+    viewport.columnStart = Math.max(1, viewport.columnStart + columnDelta);
+    renderProjection(await evaluationWorker.request({ type: "project", window: viewport }));
 }
 
 function confirmDocumentSwitch() {
@@ -340,10 +284,14 @@ document.addEventListener("click", async (event) => {
         } else if (action === "open") {
             if (await allowDocumentSwitch()) fileInput.click();
         } else if (action === "save") saveDocument();
-        else if (action === "export-csv") exportDelimited("csv");
-        else if (action === "export-tsv") exportDelimited("tsv");
+        else if (action === "export-csv") await exportDelimited("csv");
+        else if (action === "export-tsv") await exportDelimited("tsv");
         else if (action === "undo") await restoreCursor(documentLog.cursor - 1);
         else if (action === "redo") await restoreCursor(documentLog.cursor + 1);
+        else if (action === "previous-rows") await moveWindow(-viewport.rowCount, 0);
+        else if (action === "next-rows") await moveWindow(viewport.rowCount, 0);
+        else if (action === "previous-columns") await moveWindow(0, -viewport.columnCount);
+        else if (action === "next-columns") await moveWindow(0, viewport.columnCount);
     } catch (error) {
         setStatus(error.message || String(error));
     }

@@ -23,6 +23,13 @@
       <section class="rixcel-toolbar" aria-label="Editing tools">
         <button type="button" data-action="undo" disabled>Undo</button>
         <button type="button" data-action="redo" disabled>Redo</button>
+        <span class="rixcel-window-controls" aria-label="Visible grid window">
+          <button type="button" data-action="previous-rows" disabled>Previous rows</button>
+          <button type="button" data-action="next-rows" disabled>Next rows</button>
+          <button type="button" data-action="previous-columns" disabled>Previous columns</button>
+          <button type="button" data-action="next-columns" disabled>Next columns</button>
+          <output id="window-status">Rows 1–20 of 20 · Columns 1–8 of 8</output>
+        </span>
         <label><input type="checkbox" data-field="header" checked /> First imported row is a header</label>
         <span id="document-name">Untitled.rixcel</span>
         <output id="status" role="status" aria-live="polite">Ready</output>

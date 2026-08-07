@@ -6,7 +6,10 @@ const root = new URL("../", import.meta.url);
 describe("RiXCel standalone app", () => {
     test("exposes document, interchange, history, and save-before-switch controls", async () => {
         const html = await readFile(new URL("src/index.html", root), "utf8");
-        for (const action of ["new", "open", "save", "export-csv", "export-tsv", "undo", "redo"]) {
+        for (const action of [
+            "new", "open", "save", "export-csv", "export-tsv", "undo", "redo",
+            "previous-rows", "next-rows", "previous-columns", "next-columns",
+        ]) {
             expect(html).toContain(`data-action="${action}"`);
         }
         expect(html).toContain('accept=".rixcel,.csv,.tsv');
@@ -14,17 +17,20 @@ describe("RiXCel standalone app", () => {
         for (const choice of ["save", "discard", "cancel"]) expect(html).toContain(`value="${choice}"`);
     });
 
-    test("uses sparse event persistence and worker-guarded FormulaSheet editing", async () => {
+    test("uses worker-owned projection, sparse history, and bounded grid windows", async () => {
         const source = await readFile(new URL("src/main.js", root), "utf8");
-        expect(source).toContain("mountOutputWidgets");
+        expect(source).toContain("enhanceSheetViews");
         expect(source).toContain("appendRixCelEvent");
         expect(source).toContain("setRixCelCursor");
         expect(source).toContain("setRixCelDraft");
-        expect(source).toContain("beforeSheetEdit: preflightEdit");
-        expect(source).toContain("beforeSheetBatchEdit: preflightBatchEdit");
         expect(source).toContain('type: "slot:batch"');
-        expect(source).toContain("evaluationWorker.request");
+        for (const requestType of ["open", "commit", "project", "export"]) {
+            expect(source).toContain(`type: "${requestType}"`);
+        }
+        expect(source).not.toContain("parseAndEvaluate");
+        expect(source).not.toContain("createRixCelEvaluationState");
         expect(source).toContain("localStorage.setItem");
-        expect(source).toContain("model.subscribe");
+        expect(source).toContain("rowCount: 40");
+        expect(source).toContain("columnCount: 12");
     });
 });

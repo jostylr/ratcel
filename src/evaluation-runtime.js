@@ -3,8 +3,10 @@ import {
     createDefaultRegistry,
     createDefaultSystemContext,
     exportRixCelDocument,
+    formatValue,
     parseAndEvaluate,
     parseRixCelDocument,
+    renderOutputHtml,
 } from "../../../rix/src/index.js";
 
 export const RIXCEL_WITHHELD_CAPABILITIES = Object.freeze([
@@ -39,34 +41,139 @@ function evaluate(state, source) {
     return parseAndEvaluate(source, { ...state, file: "<rixcel-worker>" });
 }
 
-/**
- * Evaluate one isolated worker request. No state is shared between requests;
- * terminating the Worker therefore drops every active formula and capability.
- */
-export function evaluateRixCelRequest(request) {
-    const state = createRixCelEvaluationState();
-    if (request?.type === "validate") {
-        const document = parseRixCelDocument(request.document);
-        setText(state.context, "hosttext", JSON.stringify(document));
-        evaluate(state, ".RiXCelImport(hosttext)");
-        return { document };
+function sameHistoryPrefix(current, candidate) {
+    if (!current || candidate.cursor !== candidate.events.length) return false;
+    if (candidate.events.length !== current.cursor + 1) return false;
+    return JSON.stringify(candidate.events.slice(0, current.cursor))
+        === JSON.stringify(current.events.slice(0, current.cursor));
+}
+
+function windowFor(shape, requested = {}) {
+    const rowTotal = shape[0];
+    const columnTotal = shape[1] ?? 1;
+    const positive = (value, fallback) => Number.isSafeInteger(value) && value > 0 ? value : fallback;
+    const rowStart = Math.min(positive(requested.rowStart, 1), rowTotal);
+    const columnStart = Math.min(positive(requested.columnStart, 1), columnTotal);
+    return {
+        rowStart,
+        rowCount: Math.min(positive(requested.rowCount, 40), rowTotal - rowStart + 1),
+        columnStart,
+        columnCount: Math.min(positive(requested.columnCount, 12), columnTotal - columnStart + 1),
+    };
+}
+
+/** Persistent, worker-owned FormulaSheet session and visible-plane projector. */
+export class RixCelEvaluationSession {
+    constructor() {
+        this.state = createRixCelEvaluationState();
+        this.document = null;
+        this.model = null;
     }
-    if (request?.type === "import") {
-        const kind = request.kind === "tsv" ? "tsv" : request.kind === "csv" ? "csv" : "rixcel";
-        if (kind === "rixcel") {
-            const document = parseRixCelDocument(request.text);
-            setText(state.context, "hosttext", JSON.stringify(document));
-            evaluate(state, ".RiXCelImport(hosttext)");
-            return { document };
+
+    open(value) {
+        const document = parseRixCelDocument(value);
+        const nextState = createRixCelEvaluationState();
+        setText(nextState.context, "hosttext", JSON.stringify(document));
+        const model = evaluate(nextState, ".RiXCelImport(hosttext)");
+        nextState.context.setFresh("document", model);
+        this.state = nextState;
+        this.document = document;
+        this.model = model;
+        return this;
+    }
+
+    applyEvent(event) {
+        if (event.type === "slot:set") {
+            this.model.setFormulaSource(event.index, event.source, event.assignmentMode);
+        } else if (event.type === "slot:batch") {
+            this.model.setFormulaSources(event.edits);
+        } else if (event.type === "view:axis-label") {
+            this.model.setAxisLabel(event.axis, event.coordinate, event.label);
+        } else {
+            throw new Error(`Unsupported RiXCel session event: ${event.type}`);
         }
-        setText(state.context, "hosttext", request.text);
-        setText(state.context, "hostid", request.id || "imported");
+    }
+
+    commit(value) {
+        const candidate = parseRixCelDocument(value);
+        if (!sameHistoryPrefix(this.document, candidate)) return this.open(candidate);
+        try {
+            this.applyEvent(candidate.events.at(-1));
+            this.document = candidate;
+        } catch (error) {
+            // A failed FormulaSheet definition deliberately retains diagnostics.
+            // Reopen the last committed log so the persistent worker stays valid.
+            this.open(this.document);
+            throw error;
+        }
+        return this;
+    }
+
+    project(requestedWindow = {}) {
+        if (!this.model || !this.document) throw new Error("RiXCel worker has no open document");
+        const window = windowFor(this.document.shape, requestedWindow);
+        const view = evaluate(this.state, `.Sheet(document, {=
+            title="RiXCel document",
+            rowStart=${window.rowStart}, rowCount=${window.rowCount},
+            columnStart=${window.columnStart}, columnCount=${window.columnCount}
+        })`);
+        const html = renderOutputHtml(view, (value) =>
+            formatValue(value, { context: this.state.context, evaluate: null }));
+        return {
+            document: this.document,
+            html,
+            epoch: this.model.epoch,
+            shape: [...this.document.shape],
+            window,
+            materializedSlotCount: this.model.materializedSlotCount,
+        };
+    }
+
+    import(request) {
+        const kind = request.kind === "tsv" ? "tsv" : request.kind === "csv" ? "csv" : "rixcel";
+        if (kind === "rixcel") return this.open(parseRixCelDocument(request.text));
+        const importState = createRixCelEvaluationState();
+        setText(importState.context, "hosttext", request.text);
+        setText(importState.context, "hostid", request.id || "imported");
         const fn = kind === "tsv" ? ".RiXCelImportTsv" : ".RiXCelImportCsv";
         const model = evaluate(
-            state,
+            importState,
             `${fn}(hosttext, {= header=${request.header ? 1 : 0}, id=hostid })`,
         );
-        return { document: exportRixCelDocument(model) };
+        return this.open(exportRixCelDocument(model));
     }
-    throw new Error(`Unknown RiXCel worker request: ${request?.type || "missing type"}`);
+
+    exportDelimited(kind) {
+        if (!this.model) throw new Error("RiXCel worker has no open document");
+        const fn = kind === "tsv" ? ".RiXCelExportTsv" : ".RiXCelExportCsv";
+        return evaluate(this.state, `${fn}(document)`).value;
+    }
+
+    handle(request) {
+        if (request?.type === "open") {
+            this.open(request.document);
+            return this.project(request.window);
+        }
+        if (request?.type === "commit") {
+            this.commit(request.document);
+            return this.project(request.window);
+        }
+        if (request?.type === "project") return this.project(request.window);
+        if (request?.type === "import") {
+            this.import(request);
+            return this.project(request.window);
+        }
+        if (request?.type === "export") return { text: this.exportDelimited(request.kind) };
+        if (request?.type === "validate") {
+            const isolated = new RixCelEvaluationSession();
+            isolated.open(request.document);
+            return { document: isolated.document };
+        }
+        throw new Error(`Unknown RiXCel worker request: ${request?.type || "missing type"}`);
+    }
+}
+
+/** Backward-compatible isolated request helper used by non-worker hosts/tests. */
+export function evaluateRixCelRequest(request) {
+    return new RixCelEvaluationSession().handle(request);
 }
