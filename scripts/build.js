@@ -1,4 +1,4 @@
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm } from "node:fs/promises";
 import path from "node:path";
 
 const root = path.resolve(import.meta.dir, "..");
@@ -20,6 +20,11 @@ const browserNodeShims = {
 };
 
 await mkdir(assets, { recursive: true });
+for (const entry of await readdir(assets)) {
+    if (entry.endsWith(".js") || entry.endsWith(".js.map")) {
+        await rm(path.join(assets, entry));
+    }
+}
 await Bun.write(path.join(output, ".nojekyll"), "");
 await Bun.write(path.join(output, "index.html"), await readFile(path.join(root, "src", "index.html")));
 const sharedCss = await readFile(path.resolve(root, "../../rix-web/src/app.css"), "utf8");
@@ -27,7 +32,10 @@ const appCss = await readFile(path.join(root, "src", "app.css"), "utf8");
 await Bun.write(path.join(assets, "app.css"), `${sharedCss}\n${appCss}`);
 
 const result = await Bun.build({
-    entrypoints: [path.join(root, "src", "main.js")],
+    entrypoints: [
+        path.join(root, "src", "main.js"),
+        path.join(root, "src", "evaluation-worker.js"),
+    ],
     outdir: assets,
     target: "browser",
     format: "esm",

@@ -31,6 +31,17 @@
     </main>
 
     <input id="file-input" type="file" accept=".rixcel,.csv,.tsv,application/json,text/csv,text/tab-separated-values" hidden />
+    <dialog id="switch-document-dialog">
+      <form method="dialog">
+        <h2>Save this document?</h2>
+        <p>RiXCel has changes since the last downloaded save.</p>
+        <div class="rixcel-dialog-actions">
+          <button value="cancel">Cancel</button>
+          <button value="discard">Discard</button>
+          <button value="save">Save and continue</button>
+        </div>
+      </form>
+    </dialog>
     <script type="module" src="./assets/main.js"></script>
   </body>
 </html>

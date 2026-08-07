@@ -1,0 +1,10 @@
+{
+  "version": 3,
+  "sources": ["../../src/evaluation-worker.js"],
+  "sourcesContent": [
+    "import { evaluateRixCelRequest } from \"./evaluation-runtime.js\";\n\nself.addEventListener(\"message\", (event) => {\n    const { id, request } = event.data || {};\n    try {\n        self.postMessage({ id, type: \"result\", value: evaluateRixCelRequest(request) });\n    } catch (error) {\n        self.postMessage({\n            id,\n            type: \"error\",\n            message: error instanceof Error ? error.message : String(error),\n        });\n    }\n});\n"
+  ],
+  "mappings": ";;;;;AAEA,KAAK,iBAAiB,WAAW,CAAC,UAAU;AAAA,EACxC,QAAQ,IAAI,YAAY,MAAM,QAAQ,CAAC;AAAA,EACvC,IAAI;AAAA,IACA,KAAK,YAAY,EAAE,IAAI,MAAM,UAAU,OAAO,sBAAsB,OAAO,EAAE,CAAC;AAAA,IAChF,OAAO,OAAO;AAAA,IACZ,KAAK,YAAY;AAAA,MACb;AAAA,MACA,MAAM;AAAA,MACN,SAAS,iBAAiB,QAAQ,MAAM,UAAU,OAAO,KAAK;AAAA,IAClE,CAAC;AAAA;AAAA,CAER;",
+  "debugId": "79D7EB969D16349064756E2164756E21",
+  "names": []
+}

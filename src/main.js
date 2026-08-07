@@ -1,20 +1,23 @@
 import {
-    Context,
-    createDefaultRegistry,
-    createDefaultSystemContext,
+    appendRixCelEvent,
+    clearRixCelDraft,
+    createRixCelDocument,
     formatValue,
     mountOutputWidgets,
     parseAndEvaluate,
+    parseRixCelDocument,
     renderOutputHtml,
+    setRixCelCursor,
+    setRixCelDraft,
     stringifyRixCelDocument,
 } from "../../../rix/src/index.js";
+import { createRixCelEvaluationState } from "./evaluation-runtime.js";
+import { RixCelWorkerClient } from "./evaluation-worker-client.js";
 
-const STORAGE_KEY = "rixcel.autosave.v1";
-const state = {
-    context: new Context(),
-    registry: createDefaultRegistry(),
-    systemContext: createDefaultSystemContext(),
-};
+const STORAGE_KEY = "rixcel.autosave.v2";
+const LEGACY_STORAGE_KEY = "rixcel.autosave.v1";
+const state = createRixCelEvaluationState();
+const evaluationWorker = new RixCelWorkerClient({ timeoutMs: 2000 });
 const host = document.querySelector("#sheet-host");
 const fileInput = document.querySelector("#file-input");
 const status = document.querySelector("#status");
@@ -22,14 +25,16 @@ const documentName = document.querySelector("#document-name");
 const headerToggle = document.querySelector('[data-field="header"]');
 const undoButton = document.querySelector('[data-action="undo"]');
 const redoButton = document.querySelector('[data-action="redo"]');
+const switchDialog = document.querySelector("#switch-document-dialog");
 
 let model = null;
+let documentLog = null;
 let name = "Untitled.rixcel";
 let disposeWidgets = null;
 let unsubscribe = null;
 let restoring = false;
-let history = [];
-let historyIndex = -1;
+let dirty = false;
+let sessionFloorCursor = 0;
 
 function evaluate(source) {
     return parseAndEvaluate(source, { ...state, file: "<rixcel>" });
@@ -37,6 +42,11 @@ function evaluate(source) {
 
 function setHostText(text) {
     state.context.setFresh("hosttext", { type: "string", value: text });
+}
+
+function importDocumentMain(document) {
+    setHostText(stringifyRixCelDocument(document));
+    return evaluate(".RiXCelImport(hosttext)");
 }
 
 function exactFormat(value) {
@@ -48,43 +58,116 @@ function setStatus(message) {
 }
 
 function updateHistoryButtons() {
-    undoButton.disabled = historyIndex <= 0;
-    redoButton.disabled = historyIndex < 0 || historyIndex >= history.length - 1;
+    undoButton.disabled = !documentLog || documentLog.cursor <= sessionFloorCursor;
+    redoButton.disabled = !documentLog || documentLog.cursor >= documentLog.events.length;
 }
 
-function remember() {
-    if (restoring || !model) return;
-    const snapshot = stringifyRixCelDocument(model);
-    if (history[historyIndex] === snapshot) return;
-    history = history.slice(0, historyIndex + 1);
-    history.push(snapshot);
-    historyIndex = history.length - 1;
-    updateHistoryButtons();
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ name, document: snapshot }));
-}
-
-function bindModel(next, nextName, { resetHistory = true } = {}) {
-    unsubscribe?.();
-    model = next;
-    name = nextName || "Untitled.rixcel";
-    documentName.textContent = name;
-    state.context.setFresh("document", model);
-    if (resetHistory) {
-        history = [];
-        historyIndex = -1;
+function persistRecovery() {
+    if (!documentLog) return;
+    try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({
+            name,
+            document: stringifyRixCelDocument(documentLog),
+            dirty,
+        }));
+    } catch (error) {
+        setStatus(`Local recovery unavailable: ${error.message || String(error)}`);
     }
-    unsubscribe = model.subscribe((event) => {
-        if (event.type === "formula:commit" || event.type === "formula:view") {
-            remember();
-            setStatus(event.type === "formula:view"
-                ? "Saved labels locally"
-                : `Saved locally · epoch ${model.epoch}`);
-        } else if (event.type === "formula:error") {
-            setStatus(event.error?.message || "Formula error");
-        }
-    });
-    render();
-    remember();
+}
+
+function slotEventFromFormula(event) {
+    const cause = event.cause || {};
+    if (cause.type !== "formula:set" || !Array.isArray(cause.index) || typeof cause.source !== "string") {
+        return null;
+    }
+    return {
+        type: "slot:set",
+        index: [...cause.index],
+        source: cause.source,
+        assignmentMode: cause.assignmentMode || ":=",
+        view: {},
+    };
+}
+
+function draftFromFormulaError(event) {
+    const cause = event.cause || {};
+    if (!Array.isArray(cause.index) || typeof cause.source !== "string") return null;
+    const message = event.error?.message || String(event.error || "Formula edit did not commit");
+    return {
+        index: [...cause.index],
+        source: cause.source,
+        assignmentMode: cause.assignmentMode || ":=",
+        kind: cause.type === "formula:parse" ? "parse" : /cycle/iu.test(message) ? "cycle" : "runtime",
+        message,
+    };
+}
+
+function recordCommittedEvent(event) {
+    if (restoring || !documentLog) return;
+    if (event.type === "formula:commit") {
+        const edit = slotEventFromFormula(event);
+        if (!edit) return;
+        documentLog = appendRixCelEvent(clearRixCelDraft(documentLog, edit.index), edit);
+        dirty = true;
+        setStatus(`Saved locally · event ${documentLog.cursor} · epoch ${model.epoch}`);
+    } else if (event.type === "formula:view" && event.cause?.type === "view:axis-label") {
+        documentLog = appendRixCelEvent(documentLog, {
+            type: "view:axis-label",
+            axis: event.cause.axis,
+            coordinate: event.cause.coordinate,
+            label: event.cause.label,
+        });
+        dirty = true;
+        setStatus(`Saved label locally · event ${documentLog.cursor}`);
+    } else if (event.type === "formula:error") {
+        const draft = draftFromFormulaError(event);
+        if (draft) documentLog = setRixCelDraft(documentLog, draft);
+        dirty = true;
+        setStatus(event.error?.message || "Formula error");
+    }
+    updateHistoryButtons();
+    persistRecovery();
+}
+
+function decorateDrafts() {
+    for (const draft of documentLog?.drafts || []) {
+        const address = `grid[${draft.index.join(",")}]`;
+        const cell = [...host.querySelectorAll("td[data-rix-address]")]
+            .find((candidate) => candidate.dataset.rixAddress === address);
+        if (!cell) continue;
+        cell.dataset.rixState = "error";
+        cell.dataset.rixDiagnosticKind = draft.kind;
+        cell.dataset.rixDiagnosticSource = draft.source;
+        cell.dataset.rixDiagnostics = JSON.stringify([draft.message]);
+        cell.setAttribute("aria-invalid", "true");
+        cell.title = `${cell.title} · ${draft.kind} draft: ${draft.message}`;
+    }
+}
+
+async function preflightEdit(detail) {
+    const edit = {
+        type: "slot:set",
+        index: [...detail.index],
+        source: detail.source,
+        assignmentMode: detail.assignmentMode || ":=",
+        view: {},
+    };
+    const candidate = appendRixCelEvent(clearRixCelDraft(documentLog, edit.index), edit);
+    try {
+        await evaluationWorker.request({ type: "validate", document: candidate });
+    } catch (error) {
+        documentLog = setRixCelDraft(documentLog, {
+            index: edit.index,
+            source: edit.source,
+            assignmentMode: edit.assignmentMode,
+            kind: /compile|parse|token|unexpected/iu.test(error.message) ? "parse" : /cycle/iu.test(error.message) ? "cycle" : "runtime",
+            message: error.message,
+        });
+        dirty = true;
+        persistRecovery();
+        decorateDrafts();
+        throw error;
+    }
 }
 
 function render() {
@@ -93,34 +176,51 @@ function render() {
     host.innerHTML = renderOutputHtml(view, exactFormat);
     disposeWidgets = mountOutputWidgets(host, view, {
         format: exactFormat,
+        beforeSheetEdit: preflightEdit,
         onSelection(detail) {
             setStatus(detail.coordinateLabel || detail.address);
         },
     });
+    decorateDrafts();
 }
 
-function blankCsv(rows = 20, columns = 8) {
-    const letters = Array.from({ length: columns }, (_item, index) =>
-        String.fromCharCode(65 + index));
-    return [letters.join(","), ...Array.from({ length: rows }, () =>
-        Array(columns).fill("").join(","))].join("\n");
+function bindModel(next, nextName, nextDocument, { resetSession = true } = {}) {
+    unsubscribe?.();
+    model = next;
+    documentLog = parseRixCelDocument(nextDocument);
+    name = nextName || "Untitled.rixcel";
+    documentName.textContent = name;
+    state.context.setFresh("document", model);
+    if (resetSession) sessionFloorCursor = documentLog.cursor;
+    unsubscribe = model.subscribe(recordCommittedEvent);
+    render();
+    updateHistoryButtons();
+    persistRecovery();
 }
 
-function importText(text, kind, nextName) {
-    setHostText(text);
-    const header = headerToggle.checked ? 1 : 0;
-    const expression = kind === "rixcel"
-        ? ".RiXCelImport(hosttext)"
-        : kind === "tsv"
-            ? `.RiXCelImportTsv(hosttext, {= header=${header} })`
-            : `.RiXCelImportCsv(hosttext, {= header=${header} })`;
-    bindModel(evaluate(expression), nextName);
+async function loadDocument(document, nextName, options = {}) {
+    const canonical = parseRixCelDocument(document);
+    await evaluationWorker.request({ type: "validate", document: canonical });
+    bindModel(importDocumentMain(canonical), nextName, canonical, options);
 }
 
-function newDocument() {
-    setHostText(blankCsv());
-    bindModel(evaluate('.RiXCelImportCsv(hosttext, {= header=1, id="untitled" })'), "Untitled.rixcel");
-    setStatus("New document");
+async function importText(text, kind, nextName) {
+    const header = headerToggle.checked;
+    const id = (nextName || "imported").replace(/\.[^.]+$/u, "") || "imported";
+    const result = await evaluationWorker.request({ type: "import", kind, text, header, id });
+    bindModel(importDocumentMain(result.document), nextName, result.document);
+}
+
+async function newDocument() {
+    const document = createRixCelDocument({
+        id: "untitled",
+        shape: [20, 8],
+        view: { axes: ["row", "column"] },
+    });
+    await loadDocument(document, "Untitled.rixcel");
+    dirty = false;
+    persistRecovery();
+    setStatus("New sparse document");
 }
 
 function download(text, filename, type) {
@@ -130,6 +230,13 @@ function download(text, filename, type) {
     link.download = filename;
     link.click();
     URL.revokeObjectURL(url);
+}
+
+function saveDocument() {
+    download(stringifyRixCelDocument(documentLog), name, "application/json");
+    dirty = false;
+    persistRecovery();
+    setStatus(`Saved document with ${documentLog.events.length} history events`);
 }
 
 function exportDelimited(kind) {
@@ -144,37 +251,60 @@ async function openFile(file) {
     const text = await file.text();
     const extension = file.name.split(".").at(-1)?.toLowerCase();
     const kind = extension === "rixcel" ? "rixcel" : extension === "tsv" ? "tsv" : "csv";
-    importText(text, kind, kind === "rixcel" ? file.name : `${file.name.replace(/\.[^.]+$/u, "")}.rixcel`);
+    await importText(text, kind, kind === "rixcel" ? file.name : `${file.name.replace(/\.[^.]+$/u, "")}.rixcel`);
+    dirty = false;
+    persistRecovery();
     setStatus(`Opened ${file.name}`);
 }
 
-function restoreAt(index) {
-    if (index < 0 || index >= history.length) return;
+async function restoreCursor(cursor) {
+    if (!documentLog || cursor < sessionFloorCursor || cursor > documentLog.events.length) return;
+    const candidate = setRixCelCursor(documentLog, cursor);
     restoring = true;
     try {
-        setHostText(history[index]);
-        bindModel(evaluate(".RiXCelImport(hosttext)"), name, { resetHistory: false });
-        historyIndex = index;
-        localStorage.setItem(STORAGE_KEY, JSON.stringify({ name, document: history[index] }));
-        updateHistoryButtons();
-        setStatus(index < history.length - 1 ? "Undo restored" : "Redo restored");
+        await evaluationWorker.request({ type: "validate", document: candidate });
+        bindModel(importDocumentMain(candidate), name, candidate, { resetSession: false });
+        dirty = true;
+        setStatus(cursor < documentLog.events.length ? "Undo restored" : "Redo restored");
     } finally {
         restoring = false;
     }
 }
 
-document.addEventListener("click", (event) => {
+function confirmDocumentSwitch() {
+    if (!dirty) return Promise.resolve("discard");
+    if (!switchDialog?.showModal) {
+        return Promise.resolve(confirm("Save the current RiXCel document before continuing?") ? "save" : "cancel");
+    }
+    switchDialog.showModal();
+    return new Promise((resolve) => {
+        switchDialog.addEventListener("close", () => resolve(switchDialog.returnValue || "cancel"), { once: true });
+    });
+}
+
+async function allowDocumentSwitch() {
+    const choice = await confirmDocumentSwitch();
+    if (choice === "cancel") return false;
+    if (choice === "save") saveDocument();
+    return true;
+}
+
+document.addEventListener("click", async (event) => {
     const action = event.target.closest("[data-action]")?.dataset.action;
     if (!action) return;
-    if (action === "new") newDocument();
-    else if (action === "open") fileInput.click();
-    else if (action === "save") {
-        download(stringifyRixCelDocument(model), name, "application/json");
-        setStatus("Saved document");
-    } else if (action === "export-csv") exportDelimited("csv");
-    else if (action === "export-tsv") exportDelimited("tsv");
-    else if (action === "undo") restoreAt(historyIndex - 1);
-    else if (action === "redo") restoreAt(historyIndex + 1);
+    try {
+        if (action === "new") {
+            if (await allowDocumentSwitch()) await newDocument();
+        } else if (action === "open") {
+            if (await allowDocumentSwitch()) fileInput.click();
+        } else if (action === "save") saveDocument();
+        else if (action === "export-csv") exportDelimited("csv");
+        else if (action === "export-tsv") exportDelimited("tsv");
+        else if (action === "undo") await restoreCursor(documentLog.cursor - 1);
+        else if (action === "redo") await restoreCursor(documentLog.cursor + 1);
+    } catch (error) {
+        setStatus(error.message || String(error));
+    }
 });
 
 fileInput.addEventListener("change", async () => {
@@ -188,12 +318,29 @@ fileInput.addEventListener("change", async () => {
     }
 });
 
+window.addEventListener("beforeunload", (event) => {
+    if (!dirty) return;
+    event.preventDefault();
+    event.returnValue = "";
+});
+window.addEventListener("pagehide", () => evaluationWorker.dispose(), { once: true });
+
 try {
-    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
-    if (saved?.document) importText(saved.document, "rixcel", saved.name);
-    else newDocument();
+    const saved = JSON.parse(
+        localStorage.getItem(STORAGE_KEY)
+        || localStorage.getItem(LEGACY_STORAGE_KEY)
+        || "null",
+    );
+    if (saved?.document) {
+        await loadDocument(saved.document, saved.name);
+        dirty = saved.dirty ?? true;
+        persistRecovery();
+        setStatus("Recovered local document");
+    } else {
+        await newDocument();
+    }
 } catch (error) {
     console.warn("RiXCel local recovery failed", error);
-    newDocument();
+    await newDocument();
     setStatus("Local recovery failed; opened a new document");
 }

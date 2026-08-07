@@ -83,6 +83,11 @@ button { cursor: pointer; }
 .rixcel-sheet-host .rix-output-sheet { margin: 0; max-width: none; }
 .rixcel-sheet-host .rix-output-sheet table { min-width: 40rem; }
 .rixcel-sheet-host .rix-output-sheet-editor { position: sticky; left: 0; z-index: 3; }
+#switch-document-dialog { max-width: 28rem; border: 1px solid #c4b5fd; border-radius: 8px; padding: 1.1rem; color: #172033; box-shadow: 0 20px 60px rgb(15 23 42 / 25%); }
+#switch-document-dialog::backdrop { background: rgb(15 23 42 / 38%); }
+#switch-document-dialog h2 { margin: 0 0 .5rem; font-size: 1.1rem; }
+#switch-document-dialog p { color: #475569; }
+.rixcel-dialog-actions { display: flex; justify-content: flex-end; gap: .45rem; margin-top: 1rem; }
 @media (max-width: 760px) {
   .rixcel-header { align-items: flex-start; flex-direction: column; }
   #document-name { order: 3; width: 100%; margin-left: 0; }
