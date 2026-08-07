@@ -21,6 +21,8 @@ describe("RiXCel standalone app", () => {
         expect(source).toContain("setRixCelCursor");
         expect(source).toContain("setRixCelDraft");
         expect(source).toContain("beforeSheetEdit: preflightEdit");
+        expect(source).toContain("beforeSheetBatchEdit: preflightBatchEdit");
+        expect(source).toContain('type: "slot:batch"');
         expect(source).toContain("evaluationWorker.request");
         expect(source).toContain("localStorage.setItem");
         expect(source).toContain("model.subscribe");

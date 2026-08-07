@@ -14,10 +14,13 @@ The standalone milestone includes formula editing, assignment modes,
 exact-value feedback, named tensor coordinates, local recovery, native
 `.rixcel` open/save, CSV/TSV import/export, and document undo/redo. Version 2
 documents are sparse event logs: edits store canonical executable RiX commands,
-and undo/redo moves a cursor through that history. Imports and proposed edits
-are preflighted in a restricted Web Worker that is terminated and replaced on
-timeout. The shared runtime and widget protocol live in the sibling `rix`
-repository.
+and undo/redo moves a cursor through that history. Shift-selection supports
+multi-cell clipboard paste; Command/Ctrl+D fills down and Command/Ctrl+R fills
+right. Each paste or fill is one atomic `slot:batch` history event. Imported
+FormulaSheet graphs remain sparse and materialize implicit null cells lazily.
+Imports and proposed edits are preflighted in a restricted Web Worker that is
+terminated and replaced on timeout. The shared runtime and widget protocol live
+in the sibling `rix` repository.
 
 Formula parse, cycle, and runtime failures are recoverable in place. The grid
 marks affected cells, keeps their last committed values visible, and preserves

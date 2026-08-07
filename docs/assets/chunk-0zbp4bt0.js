@@ -3628,6 +3628,12 @@ function createReactiveGraph(options = {}) {
       read(name) {
         name = canonicalName(name);
         const node = requireNode(name);
+        if (!states.has(name)) {
+          requested.add(name);
+          stagedValues.set(name, node.value);
+          states.set(name, node.kind === "computed" ? "dirty" : "clean");
+          dependencies.set(name, new Set(node.dependencies));
+        }
         if (currentName && currentName !== name)
           dependencies.get(currentName).add(name);
         if (node.kind === "source")
@@ -3723,6 +3729,12 @@ function createReactiveGraph(options = {}) {
     type: "reactive_graph",
     id,
     epoch: 0,
+    get evaluating() {
+      return activeEpoch !== null;
+    },
+    get nodeCount() {
+      return nodes.size;
+    },
     _ext: graphMethods(),
     addSource(name, value) {
       name = normalizeName(name);
@@ -3763,6 +3775,13 @@ function createReactiveGraph(options = {}) {
         throw new Error(node.diagnostics[0] || `Reactive node ${name} has an error`);
       }
       return node.value;
+    },
+    has(name) {
+      try {
+        return nodes.has(canonicalName(name));
+      } catch {
+        return false;
+      }
     },
     peek(name) {
       name = normalizeName(name);
@@ -4207,6 +4226,33 @@ function requireFormula(formula, index) {
   return formula;
 }
 function normalizeFormulaGrid(value) {
+  if (value?.type === "sparse_formula_grid") {
+    if (!Array.isArray(value.shape) || value.shape.length === 0) {
+      throw new Error("Sparse FormulaSheet requires a non-empty shape");
+    }
+    const shape = value.shape.map((length, axis) => {
+      if (!Number.isSafeInteger(length) || length < 1) {
+        throw new Error(`Sparse FormulaSheet axis ${axis + 1} must have a positive safe length`);
+      }
+      return length;
+    });
+    const entries3 = [...value.entries ?? []].map(({ index, formula }) => ({
+      index: Object.freeze(normalizeIndex2(index, shape)),
+      formula: requireFormula(formula, index)
+    }));
+    const keys = new Set;
+    for (const { index } of entries3) {
+      const key = slotKey(index);
+      if (keys.has(key))
+        throw new Error(`Sparse FormulaSheet repeats grid[${key}]`);
+      keys.add(key);
+    }
+    return {
+      shape,
+      entries: entries3,
+      defaultFormula: requireFormula(value.defaultFormula, Array(shape.length).fill(1))
+    };
+  }
   if (isTensor(value)) {
     const shape = [...value.shape];
     if (shape.length === 0 || shape.some((length) => length === 0)) {
@@ -4219,7 +4265,7 @@ function normalizeFormulaGrid(value) {
         formula: requireFormula(formula, index)
       });
     });
-    return { shape, entries: entries3 };
+    return { shape, entries: entries3, defaultFormula: null };
   }
   const rows = valuesOf(value, "FormulaSheet formulas");
   if (rows.length === 0)
@@ -4238,7 +4284,7 @@ function normalizeFormulaGrid(value) {
       entries2.push({ index, formula: requireFormula(formula, index) });
     }
   }
-  return { shape: [matrix.length, columns], entries: entries2 };
+  return { shape: [matrix.length, columns], entries: entries2, defaultFormula: null };
 }
 function nodeNameFor(index) {
   return `slot_${index.join("_")}`;
@@ -4254,6 +4300,15 @@ function slotKey(index) {
 }
 function slotIdFor(sheetId, index) {
   return `${sheetId}:slot:${index.join(":")}`;
+}
+function visitLogicalIndices(shape, visitor, axis = 0, index = []) {
+  if (axis === shape.length) {
+    visitor(Object.freeze([...index]));
+    return;
+  }
+  for (let coordinate = 1;coordinate <= shape[axis]; coordinate += 1) {
+    visitLogicalIndices(shape, visitor, axis + 1, [...index, coordinate]);
+  }
 }
 function normalizeIndex2(index, shape) {
   const values = Array.isArray(index) ? index : index?.type === "tuple" || index?.type === "sequence" ? index.values : [index];
@@ -4336,6 +4391,12 @@ function createFormulaSheet(formulasValue, options = {}) {
   const id = options.id === null || options.id === undefined ? `formula-sheet-${nextFormulaSheetId++}` : formulaSheetId(options.id);
   const defaultAssignmentMode = assignmentMode(options.assignmentMode ?? ":=");
   const providedSlotMetadata = options.slotMetadata instanceof Map ? options.slotMetadata : new Map;
+  const defaultSlotMetadata = options.defaultSlotMetadata ?? {};
+  const defaultSlotDefinition = Object.freeze({
+    source: defaultSlotMetadata.source ?? (formulas.defaultFormula ? options.formulaSource?.(formulas.defaultFormula) : null) ?? "_",
+    assignmentMode: assignmentMode(defaultSlotMetadata.assignmentMode ?? ":="),
+    view: Object.freeze({ ...defaultSlotMetadata.view ?? {} })
+  });
   const slotMetadata = new Map(formulas.entries.map(({ index, formula }) => {
     const provided = providedSlotMetadata.get(slotKey(index)) ?? {};
     const source = provided.source ?? options.formulaSource?.(formula) ?? null;
@@ -4353,6 +4414,7 @@ function createFormulaSheet(formulasValue, options = {}) {
       diagnosticSource: null
     }];
   }));
+  const materializedSlotKeys = new Set;
   const channel = new Set;
   let currentDocumentView = Object.freeze({ ...options.documentView ?? {} });
   const graph = createReactiveGraph({
@@ -4380,12 +4442,14 @@ function createFormulaSheet(formulasValue, options = {}) {
       return currentDocumentView;
     },
     graph,
+    defaultSlotDefinition,
     get epoch() {
       return graph.epoch;
     },
     _ext: formulaSheetMethods(),
     get(index) {
       const normalized = normalizeIndex2(index, shape);
+      ensureSlot(normalized);
       return graph.get(nodeNameFor(normalized));
     },
     index(selector2) {
@@ -4414,26 +4478,30 @@ function createFormulaSheet(formulasValue, options = {}) {
       return sheet.slot(resolveLabeledCoordinate(shape, sheet.documentView, selector2, "FormulaSheet.SlotAt"));
     },
     track() {
-      for (const { index } of formulas.entries) {
-        graph.get(nodeNameFor(index));
-      }
+      visitLogicalIndices(shape, (index) => sheet.get(index));
       return sheet;
     },
     getFormula(index) {
-      return graph.node(nodeNameFor(normalizeIndex2(index, shape))).formula;
+      const normalized = normalizeIndex2(index, shape);
+      ensureSlot(normalized);
+      return graph.node(nodeNameFor(normalized)).formula;
     },
     getFormulaSource(index) {
       const normalized = normalizeIndex2(index, shape);
+      ensureSlot(normalized);
       return slotMetadata.get(slotKey(normalized)).source;
     },
     reactiveNode(index) {
-      return graph.node(nodeNameFor(normalizeIndex2(index, shape)));
+      const normalized = normalizeIndex2(index, shape);
+      ensureSlot(normalized);
+      return graph.node(nodeNameFor(normalized));
     },
     setFormula(index, formula, metadata = null) {
       if (!formula || formula.fn !== "DEFER") {
         throw new Error("FormulaSheet.SetFormula requires deferred syntax @{ ... }");
       }
       const normalized = normalizeIndex2(index, shape);
+      ensureSlot(normalized);
       const record = slotMetadata.get(slotKey(normalized));
       const previousSource = record.source;
       const previousMode = record.assignmentMode;
@@ -4514,6 +4582,58 @@ function createFormulaSheet(formulasValue, options = {}) {
         sourceKind: "formula-source"
       });
     },
+    setFormulaSources(edits) {
+      if (!Array.isArray(edits) || edits.length === 0) {
+        throw new Error("FormulaSheet batch edit requires at least one edit");
+      }
+      if (typeof options.compileFormula !== "function") {
+        throw new Error("FormulaSheet source editing requires a formula compiler");
+      }
+      const occupied = new Set;
+      const prepared = edits.map((edit) => {
+        const index = normalizeIndex2(edit?.index, shape);
+        const key = slotKey(index);
+        if (occupied.has(key))
+          throw new Error(`FormulaSheet batch repeats ${addressFor(index)}`);
+        occupied.add(key);
+        const parts = formulaSourceParts(edit?.source, edit?.assignmentMode ?? null);
+        return { index, key, parts, formula: options.compileFormula(parts.source) };
+      });
+      for (const edit of prepared)
+        ensureSlot(edit.index, false);
+      const previous = new Map(prepared.map(({ key }) => {
+        const record = slotMetadata.get(key);
+        return [key, { ...record }];
+      }));
+      for (const { key, parts } of prepared) {
+        const record = slotMetadata.get(key);
+        record.source = parts.source;
+        record.assignmentMode = parts.assignmentMode;
+        record.view = record.view?.blank === true ? Object.freeze(Object.fromEntries(Object.entries(record.view).filter(([name]) => name !== "blank"))) : record.view;
+        record.editDiagnostics = Object.freeze([]);
+        record.diagnosticKind = null;
+        record.diagnosticSource = null;
+      }
+      const publicEdits = Object.freeze(prepared.map(({ index, parts }) => Object.freeze({
+        index: Object.freeze([...index]),
+        source: parts.source,
+        assignmentMode: parts.assignmentMode,
+        view: slotMetadata.get(slotKey(index)).view
+      })));
+      try {
+        graph.applyBatch(prepared.map(({ index, formula, parts }) => ({
+          kind: "update",
+          name: nodeNameFor(index),
+          formula,
+          source: parts.source
+        })), { type: "formula:batch", edits: publicEdits });
+      } catch (error) {
+        for (const [key, snapshot] of previous)
+          Object.assign(slotMetadata.get(key), snapshot);
+        throw error;
+      }
+      return sheet;
+    },
     setAxisLabel(axisValue, coordinateValue, labelValue) {
       const axis = exactIndex(axisValue, "FormulaSheet axis label axis");
       if (axis < 1 || axis > shape.length) {
@@ -4550,6 +4670,7 @@ function createFormulaSheet(formulasValue, options = {}) {
     },
     slot(index) {
       const normalized = normalizeIndex2(index, shape);
+      ensureSlot(normalized);
       return publicSlot(graph.node(nodeNameFor(normalized)), normalized, slotMetadata.get(slotKey(normalized)));
     },
     recalculate(cause = null) {
@@ -4562,44 +4683,93 @@ function createFormulaSheet(formulasValue, options = {}) {
       channel.add(listener);
       return () => channel.delete(listener);
     },
+    get materializedSlotCount() {
+      return materializedSlotKeys.size;
+    },
+    materializedSlots() {
+      return Object.freeze([...materializedSlotKeys].map((key) => {
+        const index = Object.freeze(key.split(",").map(Number));
+        return sheet.slot(index);
+      }));
+    },
     toString() {
       return `[FormulaSheet ${shape.join("×")} · epoch ${sheet.epoch}]`;
     }
   };
-  for (const { index, formula } of formulas.entries) {
-    const metadata = slotMetadata.get(slotKey(index));
-    graph.addComputed(nodeNameFor(index), formula, {
-      source: metadata.source,
-      initialize: false,
-      evaluator(slotFormula) {
-        const near = Object.freeze({
-          type: "formula_near",
-          rank: shape.length,
-          index,
-          get(offsets) {
-            return sheet.near(index, offsets);
+  function slotMetadataFor(index) {
+    const key = slotKey(index);
+    let metadata = slotMetadata.get(key);
+    if (metadata)
+      return metadata;
+    const idForSlot = slotIdFor(id, index);
+    metadata = {
+      id: idForSlot,
+      source: defaultSlotDefinition.source,
+      assignmentMode: defaultSlotDefinition.assignmentMode,
+      view: defaultSlotDefinition.view,
+      editDiagnostics: Object.freeze([]),
+      diagnosticKind: null,
+      diagnosticSource: null
+    };
+    slotMetadata.set(key, metadata);
+    return metadata;
+  }
+  function addSlot(index, formula, initialize) {
+    const key = slotKey(index);
+    if (materializedSlotKeys.has(key))
+      return graph.node(nodeNameFor(index));
+    const metadata = slotMetadataFor(index);
+    materializedSlotKeys.add(key);
+    try {
+      graph.addComputed(nodeNameFor(index), formula, {
+        source: metadata.source,
+        initialize,
+        evaluator(slotFormula) {
+          const near = Object.freeze({
+            type: "formula_near",
+            rank: shape.length,
+            index,
+            get(offsets) {
+              return sheet.near(index, offsets);
+            }
+          });
+          const contextualBindings = [
+            ...graph.bindings(),
+            ["grid", sheet],
+            ["near", near],
+            ["index", {
+              type: "tuple",
+              values: index.map((item) => new Integer(BigInt(item)))
+            }]
+          ];
+          if (index[0] !== undefined) {
+            contextualBindings.push(["row", new Integer(BigInt(index[0]))]);
           }
-        });
-        const contextualBindings = [
-          ...graph.bindings(),
-          ["grid", sheet],
-          ["near", near],
-          ["index", {
-            type: "tuple",
-            values: index.map((item) => new Integer(BigInt(item)))
-          }]
-        ];
-        if (index[0] !== undefined) {
-          contextualBindings.push(["row", new Integer(BigInt(index[0]))]);
+          if (index[1] !== undefined) {
+            contextualBindings.push(["col", new Integer(BigInt(index[1]))]);
+          }
+          return options.runFormula(slotFormula, Object.fromEntries(contextualBindings), {
+            reactiveGraph: graph
+          });
         }
-        if (index[1] !== undefined) {
-          contextualBindings.push(["col", new Integer(BigInt(index[1]))]);
-        }
-        return options.runFormula(slotFormula, Object.fromEntries(contextualBindings), {
-          reactiveGraph: graph
-        });
-      }
-    });
+      });
+    } catch (error) {
+      materializedSlotKeys.delete(key);
+      throw error;
+    }
+    return graph.node(nodeNameFor(index));
+  }
+  function ensureSlot(index, initialize = !graph.evaluating) {
+    const key = slotKey(index);
+    if (materializedSlotKeys.has(key))
+      return graph.node(nodeNameFor(index));
+    if (!formulas.defaultFormula) {
+      throw new Error(`FormulaSheet slot ${addressFor(index)} is not defined`);
+    }
+    return addSlot(index, formulas.defaultFormula, initialize);
+  }
+  for (const { index, formula } of formulas.entries) {
+    addSlot(index, formula, false);
   }
   graph.subscribe((event) => {
     const metadata = event.cause?.metadata;
@@ -19178,7 +19348,7 @@ var RIXCEL_FORMAT = "rixcel";
 var RIXCEL_VERSION = 2;
 var RIXCEL_ASSIGNMENT_MODES = FORMULA_SHEET_ASSIGNMENT_MODES;
 var ASSIGNMENT_MODES2 = new Set(RIXCEL_ASSIGNMENT_MODES);
-var EVENT_TYPES = new Set(["slot:set", "view:axis-label"]);
+var EVENT_TYPES = new Set(["slot:set", "slot:batch", "view:axis-label"]);
 var DOCUMENT_VIEW_KEYS = Object.freeze([
   "title",
   "axes",
@@ -19277,14 +19447,6 @@ function linearOffset(index, shape) {
     offset = offset * shape[axis] + index[axis] - 1;
   }
   return offset;
-}
-function indexFromOffset(offset, shape) {
-  const index = Array(shape.length);
-  for (let axis = shape.length - 1;axis >= 0; axis -= 1) {
-    index[axis] = offset % shape[axis] + 1;
-    offset = Math.floor(offset / shape[axis]);
-  }
-  return index;
 }
 function normalizeIndex3(value, shape, path) {
   if (!Array.isArray(value) || value.length !== shape.length) {
@@ -19397,6 +19559,9 @@ function rixCelEventCommand(event, binding = "document") {
   if (event.type === "view:axis-label") {
     return `${binding}.SetAxisLabel(${event.axis}, ${event.coordinate}, ${JSON.stringify(event.label)})`;
   }
+  if (event.type === "slot:batch") {
+    return `{; ${event.edits.map((edit) => rixCelEventCommand({ type: "slot:set", ...edit }, binding)).join("; ")} }`;
+  }
   throw new Error(`Unsupported RiXCel history event type: ${event.type}`);
 }
 function normalizeEvent(rawEvent, offset, id, shape) {
@@ -19412,7 +19577,23 @@ function normalizeEvent(rawEvent, offset, id, shape) {
     type,
     index: normalizeIndex3(event.index, shape, `${path}.index`),
     ...normalizeSlotDefinition(event, path)
-  } : (() => {
+  } : type === "slot:batch" ? (() => {
+    if (!Array.isArray(event.edits) || event.edits.length < 1) {
+      fail(`${path}.edits`, "must be a non-empty array");
+    }
+    const occupied = new Set;
+    const edits = event.edits.map((edit, editOffset) => {
+      const editPath = `${path}.edits[${editOffset}]`;
+      plainObject(edit, editPath);
+      const index = normalizeIndex3(edit.index, shape, `${editPath}.index`);
+      const key = indexKey(index);
+      if (occupied.has(key))
+        fail(`${editPath}.index`, "duplicates a coordinate in this batch");
+      occupied.add(key);
+      return { index, ...normalizeSlotDefinition(edit, editPath) };
+    });
+    return { id: eventId(id, sequence2), sequence: sequence2, type, edits };
+  })() : (() => {
     const axis = event.axis;
     const coordinate = event.coordinate;
     if (!Number.isSafeInteger(axis) || axis < 1 || axis > shape.length) {
@@ -19613,27 +19794,29 @@ function clearRixCelDraft(value, index) {
     drafts: document.drafts.filter((item) => indexKey(item.index) !== key)
   });
 }
-function materializeRixCelDocument(value) {
+function replayRixCelDocument(value) {
   const document = parseRixCelDocument(value);
-  const { size } = documentShape(document.shape);
-  const slots = Array.from({ length: size }, (_unused, offset) => {
-    const index = indexFromOffset(offset, document.shape);
-    return {
-      id: slotId(document.id, index),
-      index,
-      source: document.defaultSlot.source,
-      assignmentMode: document.defaultSlot.assignmentMode,
-      view: jsonClone(document.defaultSlot.view, "$.defaultSlot.view")
-    };
-  });
-  const byIndex = new Map(slots.map((slot) => [indexKey(slot.index), slot]));
+  const byIndex = new Map;
   let view = jsonClone(document.view, "$.view");
   for (const event of document.events.slice(0, document.cursor)) {
     if (event.type === "slot:set") {
-      const slot = byIndex.get(indexKey(event.index));
-      slot.source = event.source;
-      slot.assignmentMode = event.assignmentMode;
-      slot.view = jsonClone(event.view, `$.events[${event.sequence - 1}].view`);
+      byIndex.set(indexKey(event.index), {
+        id: slotId(document.id, event.index),
+        index: [...event.index],
+        source: event.source,
+        assignmentMode: event.assignmentMode,
+        view: jsonClone(event.view, `$.events[${event.sequence - 1}].view`)
+      });
+    } else if (event.type === "slot:batch") {
+      for (const edit of event.edits) {
+        byIndex.set(indexKey(edit.index), {
+          id: slotId(document.id, edit.index),
+          index: [...edit.index],
+          source: edit.source,
+          assignmentMode: edit.assignmentMode,
+          view: jsonClone(edit.view, `$.events[${event.sequence - 1}].edits.view`)
+        });
+      }
     } else if (event.type === "view:axis-label") {
       const labels = Array.from({ length: document.shape.length }, (_unused, axis) => {
         const existing = view.axisLabels?.[axis];
@@ -19643,7 +19826,11 @@ function materializeRixCelDocument(value) {
       view = { ...view, axisLabels: labels.map((axisLabels) => axisLabels.every((label) => label === null) ? null : axisLabels) };
     }
   }
-  return { ...document, view: normalizeDocumentView(view, "$.view", document.shape), slots };
+  return {
+    document,
+    view: normalizeDocumentView(view, "$.view", document.shape),
+    slots: [...byIndex.values()].sort((left, right) => linearOffset(left.index, document.shape) - linearOffset(right.index, document.shape))
+  };
 }
 function exportRixCelDocument(sheet) {
   if (!isFormulaSheet(sheet))
@@ -19652,24 +19839,17 @@ function exportRixCelDocument(sheet) {
     id: sheet.id,
     shape: [...sheet.shape],
     view: jsonClone(sheet.documentView ?? {}, "$.view"),
-    defaultSlot: { source: "_", assignmentMode: ":=", view: {} }
+    defaultSlot: sheet.defaultSlotDefinition ?? { source: "_", assignmentMode: ":=", view: {} }
   });
-  const visit = (axis, index) => {
-    if (axis === sheet.shape.length) {
-      const slot = sheet.slot(index);
-      if (typeof slot.source !== "string")
-        throw new Error(`RiXCel export requires source for grid[${index.join(",")}]`);
-      const current = { source: slot.source, assignmentMode: slot.assignmentMode, view: slot.view ?? {} };
-      if (JSON.stringify(current) !== JSON.stringify(document.defaultSlot)) {
-        document = appendRixCelEvent(document, { type: "slot:set", index: [...index], ...current });
-      }
-      return;
+  for (const slot of sheet.materializedSlots()) {
+    const index = [...slot.index];
+    if (typeof slot.source !== "string")
+      throw new Error(`RiXCel export requires source for grid[${index.join(",")}]`);
+    const current = { source: slot.source, assignmentMode: slot.assignmentMode, view: slot.view ?? {} };
+    if (JSON.stringify(current) !== JSON.stringify(document.defaultSlot)) {
+      document = appendRixCelEvent(document, { type: "slot:set", index, ...current });
     }
-    for (let coordinate = 1;coordinate <= sheet.shape[axis]; coordinate += 1) {
-      visit(axis + 1, [...index, coordinate]);
-    }
-  };
-  visit(0, []);
+  }
   return document;
 }
 function stringifyRixCelDocument(value, options = {}) {
@@ -19681,28 +19861,40 @@ function stringifyRixCelDocument(value, options = {}) {
   return JSON.stringify(document, null, space);
 }
 function importRixCelDocument(value, options = {}) {
-  const document = materializeRixCelDocument(value);
+  const { document, view, slots } = replayRixCelDocument(value);
   if (typeof options.compileFormula !== "function")
     throw new Error("RiXCel import requires a formula compiler");
   if (typeof options.runFormula !== "function")
     throw new Error("RiXCel import requires a deferred formula evaluator");
-  const formulas = document.slots.map((slot) => {
+  let defaultFormula;
+  try {
+    defaultFormula = options.compileFormula(document.defaultSlot.source);
+  } catch (error) {
+    throw new Error(`RiXCel default slot source did not compile: ${error.message}`);
+  }
+  const entries2 = slots.map((slot) => {
     try {
-      return options.compileFormula(slot.source);
+      return { index: slot.index, formula: options.compileFormula(slot.source) };
     } catch (error) {
       throw new Error(`RiXCel source for grid[${slot.index.join(",")}] did not compile: ${error.message}`);
     }
   });
-  const slotMetadata = new Map(document.slots.map((slot) => [indexKey(slot.index), {
+  const slotMetadata = new Map(slots.map((slot) => [indexKey(slot.index), {
     id: slot.id,
     source: slot.source,
     assignmentMode: slot.assignmentMode,
     view: slot.view
   }]));
-  return createFormulaSheet(createTensor(document.shape, formulas), {
+  return createFormulaSheet({
+    type: "sparse_formula_grid",
+    shape: document.shape,
+    entries: entries2,
+    defaultFormula
+  }, {
     ...options,
     id: document.id,
-    documentView: document.view,
+    documentView: view,
+    defaultSlotMetadata: document.defaultSlot,
     slotMetadata
   });
 }
@@ -33459,7 +33651,7 @@ class RendererRegistry {
         failures.push({ level: "warning", code: error.code, message: error.message });
       }
     }
-    const detail = failures.map(({ message }) => message).join("; ");
+    const detail = failures.map(({ code, message }) => `[${code}] ${message}`).join("; ");
     throw new UnsupportedRenderError(`Cannot render ${inputKind(value)} as '${requested}'${detail ? `: ${detail}` : ""}`, {
       code: "render-negotiation-failed",
       target: requested
@@ -36348,6 +36540,7 @@ function sheetPlaneKey2(selections) {
   return [...selections].sort((left, right) => Number(left.axis) - Number(right.axis)).map(({ axis, value }) => `${Number(axis)}:${Number(value)}`).join(",");
 }
 var RIXCEL_FORMULA_CLIPBOARD_TYPE = "application/x-rixcel-formula";
+var RIXCEL_FORMULA_BLOCK_CLIPBOARD_TYPE = "application/x-rixcel-formula-block";
 function parseSheetFormulaClipboard(text4, fallbackAssignmentMode = ":=") {
   const source = String(text4 ?? "");
   const match = source.match(/^\s*(::=|~~=|:=|~=|=)\s*([\s\S]+)$/u);
@@ -36355,6 +36548,30 @@ function parseSheetFormulaClipboard(text4, fallbackAssignmentMode = ":=") {
     source: match ? match[2] : source,
     assignmentMode: match?.[1] ?? fallbackAssignmentMode
   });
+}
+function parseSheetFormulaBlock(text4, fallbackAssignmentMode = ":=") {
+  const rows = String(text4 ?? "").replace(/\r\n?/gu, `
+`).split(`
+`);
+  if (rows.at(-1) === "")
+    rows.pop();
+  return Object.freeze(rows.map((row) => Object.freeze(row.split("\t").map((cell) => parseSheetFormulaClipboard(cell, fallbackAssignmentMode)))));
+}
+function sheetFormulaFill(block, direction = "down") {
+  if (!Array.isArray(block) || block.length === 0 || !block.every((row) => Array.isArray(row))) {
+    throw new Error("Formula fill requires a non-empty rectangular block");
+  }
+  const width = block[0].length;
+  if (width === 0 || !block.every((row) => row.length === width)) {
+    throw new Error("Formula fill requires a non-empty rectangular block");
+  }
+  if (direction === "down") {
+    return Object.freeze(block.map((_row, row) => Object.freeze(block[0].map((formula) => Object.freeze({ ...formula })))));
+  }
+  if (direction === "right") {
+    return Object.freeze(block.map((row) => Object.freeze(row.map(() => Object.freeze({ ...row[0] })))));
+  }
+  throw new Error(`Unsupported formula fill direction: ${direction}`);
 }
 function sheetCellDiagnostics(dataset = {}) {
   let diagnostics = [];
@@ -36452,6 +36669,8 @@ function enhanceSheet(sheet, options) {
   const editStatus = editForm?.querySelector("[data-rix-edit-status]");
   const editableHeaders = [...sheet.querySelectorAll("th[data-rix-header-axis][data-rix-header-coordinate]")];
   let selectedCell = null;
+  let selectionAnchor = null;
+  let selectedCells = [];
   let editPending = false;
   if (editForm && typeof options.onEdit === "function")
     editForm.hidden = false;
@@ -36512,12 +36731,40 @@ function enhanceSheet(sheet, options) {
       updateCellTitle(candidate);
     }
   }
-  function select(cell, { focus = false, notify = true } = {}) {
+  function selectionFor(cell, extend) {
+    if (!extend || !selectionAnchor || selectionAnchor.closest("tbody") !== cell.closest("tbody")) {
+      selectionAnchor = cell;
+      return [cell];
+    }
+    const rowStart = Math.min(Number(selectionAnchor.dataset.rixRow), Number(cell.dataset.rixRow));
+    const rowEnd = Math.max(Number(selectionAnchor.dataset.rixRow), Number(cell.dataset.rixRow));
+    const columnStart = Math.min(Number(selectionAnchor.dataset.rixColumn), Number(cell.dataset.rixColumn));
+    const columnEnd = Math.max(Number(selectionAnchor.dataset.rixColumn), Number(cell.dataset.rixColumn));
+    return [...cell.closest("tbody").querySelectorAll("td[data-rix-address]")].filter((candidate) => {
+      const row = Number(candidate.dataset.rixRow);
+      const column = Number(candidate.dataset.rixColumn);
+      return row >= rowStart && row <= rowEnd && column >= columnStart && column <= columnEnd;
+    });
+  }
+  function selectedFormulaBlock() {
+    const rows = [...new Set(selectedCells.map((cell) => Number(cell.dataset.rixRow)))].sort((a, b) => a - b);
+    const columns = [...new Set(selectedCells.map((cell) => Number(cell.dataset.rixColumn)))].sort((a, b) => a - b);
+    return rows.map((row) => columns.map((column) => {
+      const cell = selectedCells.find((candidate) => Number(candidate.dataset.rixRow) === row && Number(candidate.dataset.rixColumn) === column);
+      return {
+        source: cell?.dataset.rixFormulaSource ?? "_",
+        assignmentMode: cell?.dataset.rixAssignmentMode || ":="
+      };
+    }));
+  }
+  function select(cell, { focus = false, notify = true, extend = false } = {}) {
+    selectedCells = selectionFor(cell, extend);
+    const selectedSet = new Set(selectedCells);
     for (const candidate of cells) {
-      const selected = candidate === cell;
+      const selected = selectedSet.has(candidate);
       candidate.classList.toggle("rix-sheet-cell-selected", selected);
       candidate.setAttribute("aria-selected", String(selected));
-      candidate.tabIndex = selected ? 0 : -1;
+      candidate.tabIndex = candidate === cell ? 0 : -1;
     }
     const detail = eventDetail(cell);
     selectedCell = cell;
@@ -36552,8 +36799,9 @@ function enhanceSheet(sheet, options) {
     if (focus)
       cell.focus();
     if (notify) {
-      options.onSelection?.(detail, cell, sheet);
-      dispatchSheetEvent(sheet, "rix-sheet-select", detail);
+      const selection = selectedCells.map(eventDetail);
+      options.onSelection?.({ ...detail, selection }, cell, sheet);
+      dispatchSheetEvent(sheet, "rix-sheet-select", { ...detail, selection });
     }
     return detail;
   }
@@ -36596,6 +36844,35 @@ function enhanceSheet(sheet, options) {
     editForm.requestSubmit();
     return true;
   }
+  async function applyFormulaBlock(originCell, block, kind = "paste") {
+    if (typeof options.onBatchEdit !== "function" || !Array.isArray(block) || !block.length)
+      return false;
+    const bodyCells = [...originCell.closest("tbody").querySelectorAll("td[data-rix-address]")];
+    const originRow = Number(originCell.dataset.rixRow);
+    const originColumn = Number(originCell.dataset.rixColumn);
+    const edits = [];
+    for (const [rowOffset, row] of block.entries()) {
+      for (const [columnOffset, formula] of row.entries()) {
+        const target = bodyCells.find((candidate) => Number(candidate.dataset.rixRow) === originRow + rowOffset && Number(candidate.dataset.rixColumn) === originColumn + columnOffset);
+        if (!target)
+          continue;
+        edits.push({
+          ...eventDetail(target),
+          source: formula.source,
+          assignmentMode: formula.assignmentMode || ":="
+        });
+      }
+    }
+    if (!edits.length)
+      return false;
+    const result = await options.onBatchEdit({ type: kind, edits }, originCell, sheet);
+    if (result?.type === "error")
+      throw new Error(result.text);
+    if (Array.isArray(result?.updates))
+      applyCellUpdates(result.updates);
+    dispatchSheetEvent(sheet, `rix-sheet-${kind}`, { edits, revision: result?.revision ?? null });
+    return true;
+  }
   function changePlane() {
     const selections = planeSelectors.map((selector2) => ({
       axis: Number(selector2.dataset.rixSheetAxis),
@@ -36633,7 +36910,7 @@ function enhanceSheet(sheet, options) {
     });
     cell.addEventListener("click", (event) => {
       event.stopPropagation();
-      select(cell, { focus: true });
+      select(cell, { focus: true, extend: event.shiftKey });
     });
     cell.addEventListener("dblclick", (event) => {
       event.preventDefault();
@@ -36646,7 +36923,11 @@ function enhanceSheet(sheet, options) {
       const source = cell.dataset.rixFormulaSource;
       if (!event.clipboardData || source === undefined)
         return;
-      event.clipboardData.setData("text/plain", `${cell.dataset.rixAssignmentMode || ":="} ${source}`);
+      const block = selectedFormulaBlock();
+      const plain = block.map((row) => row.map((formula) => `${formula.assignmentMode} ${formula.source}`).join("\t")).join(`
+`);
+      event.clipboardData.setData("text/plain", plain);
+      event.clipboardData.setData(RIXCEL_FORMULA_BLOCK_CLIPBOARD_TYPE, JSON.stringify({ cells: block }));
       event.clipboardData.setData(RIXCEL_FORMULA_CLIPBOARD_TYPE, JSON.stringify({
         source,
         assignmentMode: cell.dataset.rixAssignmentMode || ":="
@@ -36654,7 +36935,32 @@ function enhanceSheet(sheet, options) {
       event.preventDefault();
       dispatchSheetEvent(sheet, "rix-sheet-copy", eventDetail(cell));
     });
-    cell.addEventListener("paste", (event) => {
+    cell.addEventListener("paste", async (event) => {
+      let block = null;
+      const encoded = event.clipboardData?.getData?.(RIXCEL_FORMULA_BLOCK_CLIPBOARD_TYPE);
+      if (encoded) {
+        try {
+          const parsed = JSON.parse(encoded);
+          if (Array.isArray(parsed.cells))
+            block = parsed.cells;
+        } catch {
+          block = null;
+        }
+      }
+      block ??= parseSheetFormulaBlock(event.clipboardData?.getData?.("text/plain") ?? "");
+      if (block.length > 1 || block[0]?.length > 1) {
+        if (!options.onBatchEdit)
+          return;
+        event.preventDefault();
+        event.stopPropagation();
+        try {
+          await applyFormulaBlock(cell, block, "paste");
+        } catch (error) {
+          if (editStatus)
+            editStatus.textContent = error.message || String(error);
+        }
+        return;
+      }
       if (!pasteInto(cell, event.clipboardData))
         return;
       event.preventDefault();
@@ -36662,6 +36968,19 @@ function enhanceSheet(sheet, options) {
       dispatchSheetEvent(sheet, "rix-sheet-paste", eventDetail(cell));
     });
     cell.addEventListener("keydown", (event) => {
+      if ((event.metaKey || event.ctrlKey) && (event.key === "d" || event.key === "r")) {
+        if (selectedCells.length > 1 && options.onBatchEdit) {
+          event.preventDefault();
+          event.stopPropagation();
+          const block = sheetFormulaFill(selectedFormulaBlock(), event.key === "d" ? "down" : "right");
+          const origin = selectedCells.reduce((best, candidate) => Number(candidate.dataset.rixRow) < Number(best.dataset.rixRow) || candidate.dataset.rixRow === best.dataset.rixRow && Number(candidate.dataset.rixColumn) < Number(best.dataset.rixColumn) ? candidate : best);
+          applyFormulaBlock(origin, block, "fill").catch((error) => {
+            if (editStatus)
+              editStatus.textContent = error.message || String(error);
+          });
+        }
+        return;
+      }
       if (event.key === "F2") {
         event.preventDefault();
         event.stopPropagation();
@@ -36692,7 +37011,7 @@ function enhanceSheet(sheet, options) {
       event.stopPropagation();
       const target = bodyCells.find((candidate) => Number(candidate.dataset.rixRow) === next.row && Number(candidate.dataset.rixColumn) === next.column);
       if (target)
-        select(target, { focus: true });
+        select(target, { focus: true, extend: event.shiftKey });
     });
   }
   if (typeof options.onHeaderEdit === "function") {
@@ -37906,6 +38225,29 @@ function mountOutputWidgets(root, value, options = {}) {
               revision: widgetSession.revision
             };
           }
+        } : null,
+        onBatchEdit: widgetSession?.editMode === "formula" ? async (detail) => {
+          try {
+            if (typeof options.beforeSheetBatchEdit === "function") {
+              await options.beforeSheetBatchEdit(detail, widgetSession.current());
+            }
+            widgetSession.formulaSheet.setFormulaSources(detail.edits.map((edit) => ({
+              index: edit.index,
+              source: edit.source,
+              assignmentMode: edit.assignmentMode
+            })));
+            return {
+              type: "result",
+              updates: widgetSession.cellUpdates(format),
+              revision: widgetSession.revision
+            };
+          } catch (error) {
+            return {
+              type: "error",
+              text: error instanceof Error ? error.message : String(error),
+              revision: widgetSession.revision
+            };
+          }
         } : null
       });
     }
@@ -38152,5 +38494,5 @@ function evaluateRixCelRequest(request) {
 
 export { renderOutputHtml, formatValue, parseRixCelDocument, createRixCelDocument, appendRixCelEvent, setRixCelCursor, setRixCelDraft, clearRixCelDraft, stringifyRixCelDocument, parseAndEvaluate, mountOutputWidgets, createRixCelEvaluationState, evaluateRixCelRequest };
 
-//# debugId=6B3D1456ABC0206F64756E2164756E21
-//# sourceMappingURL=chunk-cqa29xf5.js.map
+//# debugId=3B92578FED8417B764756E2164756E21
+//# sourceMappingURL=chunk-0zbp4bt0.js.map

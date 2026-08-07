@@ -89,6 +89,20 @@ function slotEventFromFormula(event) {
     };
 }
 
+function batchEventFromFormula(event) {
+    const cause = event.cause || {};
+    if (cause.type !== "formula:batch" || !Array.isArray(cause.edits) || cause.edits.length === 0) return null;
+    return {
+        type: "slot:batch",
+        edits: cause.edits.map((edit) => ({
+            index: [...edit.index],
+            source: edit.source,
+            assignmentMode: edit.assignmentMode || ":=",
+            view: edit.view || {},
+        })),
+    };
+}
+
 function draftFromFormulaError(event) {
     const cause = event.cause || {};
     if (!Array.isArray(cause.index) || typeof cause.source !== "string") return null;
@@ -105,6 +119,17 @@ function draftFromFormulaError(event) {
 function recordCommittedEvent(event) {
     if (restoring || !documentLog) return;
     if (event.type === "formula:commit") {
+        const batch = batchEventFromFormula(event);
+        if (batch) {
+            let next = documentLog;
+            for (const edit of batch.edits) next = clearRixCelDraft(next, edit.index);
+            documentLog = appendRixCelEvent(next, batch);
+            dirty = true;
+            setStatus(`Saved ${batch.edits.length} cells locally · event ${documentLog.cursor} · epoch ${model.epoch}`);
+            updateHistoryButtons();
+            persistRecovery();
+            return;
+        }
         const edit = slotEventFromFormula(event);
         if (!edit) return;
         documentLog = appendRixCelEvent(clearRixCelDraft(documentLog, edit.index), edit);
@@ -170,6 +195,22 @@ async function preflightEdit(detail) {
     }
 }
 
+async function preflightBatchEdit(detail) {
+    const event = {
+        type: "slot:batch",
+        edits: detail.edits.map((edit) => ({
+            index: [...edit.index],
+            source: edit.source,
+            assignmentMode: edit.assignmentMode || ":=",
+            view: {},
+        })),
+    };
+    let next = documentLog;
+    for (const edit of event.edits) next = clearRixCelDraft(next, edit.index);
+    const candidate = appendRixCelEvent(next, event);
+    await evaluationWorker.request({ type: "validate", document: candidate });
+}
+
 function render() {
     disposeWidgets?.();
     const view = evaluate('.Sheet(document, {= title="RiXCel document" })');
@@ -177,6 +218,7 @@ function render() {
     disposeWidgets = mountOutputWidgets(host, view, {
         format: exactFormat,
         beforeSheetEdit: preflightEdit,
+        beforeSheetBatchEdit: preflightBatchEdit,
         onSelection(detail) {
             setStatus(detail.coordinateLabel || detail.address);
         },
