@@ -71075,8 +71075,9 @@ GeometryConstructionRecord(graph) -> {;
     valid=GeometryRequireConstructionGraph(graph,"geometry.ConstructionRecord");
     records=valid[:nodes].Map((node)->{;
         value=node[:value];
-        kind=((value ? :Map)&&value.Has("kind")) ?: value[:kind] ?_ :value;
-        structured=value ? :Map;
+        tool=GeometryOption(node,"tool",_);
+        kind=tool!=_ ?: tool ?_ ((value ? :Map)&&value.Has("kind")) ?: value[:kind] ?_ :value;
+        structured=tool==:measurement ?: 0 ?_ value ? :Map;
         status=structured ?: (value.Has("status") ?: value[:status] ?_ _) ?_ _;
         diagnostic=structured ?: (value.Has("diagnostic") ?: value[:diagnostic] ?_ _) ?_ _;
         {= id=node[:id],free=node[:free],dependsOn=node[:dependsOn],kind=kind,status=status,diagnostic=diagnostic,value=value };
@@ -72141,8 +72142,8 @@ GeometryWorkbench(graph, options ?= {= }) -> {;
     surface ? :Array ?: _ ?_ .Error("geometry.Workbench surface must be an array of Graphics nodes");
     children:=surface; unresolved:=0; interactive:=[];
     {@ index=1; index<=@valid[:nodes].Len(); {;
-        node=@valid[:nodes][index]; value=node[:value]; id=node[:id];
-        schema=((value ? :Map)&&value.Has("schema")) ?: value[:schema] ?_ _;
+        node=@valid[:nodes][index]; value=node[:value]; id=node[:id]; tool=GeometryOption(node,"tool",_);
+        schema=tool==:measurement ?: _ ?_ ((value ? :Map)&&value.Has("schema")) ?: value[:schema] ?_ _;
         drawable=schema=="rix.geometry@1"||schema=="rix.geometry.intersection@1";
         drawable
           ?: {;
@@ -72175,9 +72176,10 @@ GeometryWorkbench(graph, options ?= {= }) -> {;
 GeometryAuthoringWorkbench(graph,actions,options ?= {= }) -> {;
     valid=GeometryRequireConstructionGraph(graph,"geometry.AuthoringWorkbench");
     options ? :Map ?: _ ?_ .Error("geometry.AuthoringWorkbench options must be a map");
-    actions ? :Array ?: _ ?_ .Error("geometry.AuthoringWorkbench actions must be [point, undo, redo] or [point, line, circle, undo, redo] Graphics actions");
+    actions ? :Array ?: _ ?_ .Error("geometry.AuthoringWorkbench actions must be a supported ordered Graphics action set");
     expandedActions=actions.Len()==5;
-    (actions.Len()==3||expandedActions) ?: _ ?_ .Error("geometry.AuthoringWorkbench requires three baseline actions or five point/line/circle actions");
+    selectionActions=actions.Len()==7;
+    (actions.Len()==3||expandedActions||selectionActions) ?: _ ?_ .Error("geometry.AuthoringWorkbench actions must be [point, undo, redo], [point, line, circle, undo, redo], or [point, line, circle, intersection, measurement, undo, redo]");
     size=GeometryNumericSequence(GeometryOption(options,"size",[720,480]),2,"geometry.AuthoringWorkbench size");
     view=GeometryNumericSequence(GeometryOption(options,"view",[-10,-10,10,10]),4,"geometry.AuthoringWorkbench view");
     xmin=view[1]; ymin=view[2]; xmax=view[3]; ymax=view[4];
@@ -72194,18 +72196,24 @@ GeometryAuthoringWorkbench(graph,actions,options ?= {= }) -> {;
     actionPrefix=GeometryOption(options,"actionprefix","geometry-author");
     actionPrefix ? :String ?: _ ?_ .Error("geometry.AuthoringWorkbench actionPrefix must be a String");
     surfaceActionId=@"@{actionPrefix}-point"; lineActionId=@"@{actionPrefix}-line"; circleActionId=@"@{actionPrefix}-circle";
+    intersectionActionId=@"@{actionPrefix}-intersection"; measurementActionId=@"@{actionPrefix}-measurement";
     undoActionId=@"@{actionPrefix}-undo"; redoActionId=@"@{actionPrefix}-redo";
     coordinateSystem={= view=view,frame=frame };
-    tools=expandedActions ?: [:point,:line,:circle] ?_ [:point];
-    toolSpecs=expandedActions ?: [
-        {= tool=:point,actionId=surfaceActionId,selectionKind=:canvas,selectionCount=1 },
-        {= tool=:line,actionId=lineActionId,selectionKind=:point,selectionCount=2 },
-        {= tool=:circle,actionId=circleActionId,selectionKind=:point,selectionCount=2 }
-    ] ?_ [{= tool=:point,actionId=surfaceActionId,selectionKind=:canvas,selectionCount=1 }];
+    tools=selectionActions ?: [:point,:line,:circle,:intersection,:measurement]
+      ?_ expandedActions ?: [:point,:line,:circle] ?_ [:point];
+    pointSpec={= tool=:point,label="Point",actionId=surfaceActionId,selectionKind=:canvas,selectionCount=1 };
+    lineSpec={= tool=:line,label="Line",actionId=lineActionId,selectionKind=:object,selectionKinds=[:point],selectionCount=2,operandLabels=["first point","second point"] };
+    circleSpec={= tool=:circle,label="Circle",actionId=circleActionId,selectionKind=:object,selectionKinds=[:point],selectionCount=2,operandLabels=["center","through-point"] };
+    toolSpecs=selectionActions ?: [
+        pointSpec,lineSpec,circleSpec,
+        {= tool=:intersection,label="Intersection",actionId=intersectionActionId,selectionKind=:object,selectionKinds=[:line,:circle,:conic],selectionCount=2,operandLabels=["first curve","second curve"] },
+        {= tool=:measurement,label="Distance",actionId=measurementActionId,selectionKind=:object,selectionKinds=[:point],selectionCount=2,operandLabels=["first point","second point"] }
+    ] ?_ expandedActions ?: [pointSpec,lineSpec,circleSpec] ?_ [pointSpec];
     policy={=
         schema="rix.geometry.authoring-policy@1",tool=:point,tools=tools,toolSpecs=toolSpecs,
         maxNodes=maxNodes,snap=snap,idPrefix=idPrefix,coordinateSystem=coordinateSystem,
         surfaceActionId=surfaceActionId,lineActionId=lineActionId,circleActionId=circleActionId,
+        intersectionActionId=intersectionActionId,measurementActionId=measurementActionId,
         undoActionId=undoActionId,redoActionId=redoActionId,
         exactCoordinates=1,deterministicIds=1
     };
@@ -84191,5 +84199,5 @@ var STATIC_SYSTEM_CATALOG = Object.freeze([
 ].map(([name, documentation]) => ({ name, kind: "function", documentation, source: "rix-core" })));
 export { renderOutputHtml, formatValue, Context, parseRixCelDocument, createRixCelDocument, appendRixCelEvent, setRixCelCursor, setRixCelDraft, clearRixCelDraft, exportRixCelDocument, stringifyRixCelDocument, createDefaultRegistry, createDefaultSystemContext, parseAndEvaluate, enhanceSheetViews };
 
-//# debugId=5FA47CEFD7709A0D64756E2164756E21
-//# sourceMappingURL=chunk-28rgfkfy.js.map
+//# debugId=044262435F75D92264756E2164756E21
+//# sourceMappingURL=chunk-a86m3sxx.js.map

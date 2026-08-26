@@ -7,7 +7,7 @@ import {
   parseAndEvaluate,
   parseRixCelDocument,
   renderOutputHtml
-} from "./chunk-28rgfkfy.js";
+} from "./chunk-a86m3sxx.js";
 
 // src/evaluation-runtime.js
 var RIXCEL_WITHHELD_CAPABILITIES = Object.freeze([
