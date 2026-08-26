@@ -7,7 +7,7 @@ import {
   setRixCelCursor,
   setRixCelDraft,
   stringifyRixCelDocument
-} from "./chunk-w5n8w5ks.js";
+} from "./chunk-28rgfkfy.js";
 
 // src/evaluation-worker-client.js
 var DEFAULT_TIMEOUT_MS = 2000;
